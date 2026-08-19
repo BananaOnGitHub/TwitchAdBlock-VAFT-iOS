@@ -1,13 +1,13 @@
 /*
  * TwitchAdBlock for iOS
  *
- * Native iOS adaptation of pixeltris/TwitchAdSolutions video-swap-new 1.55.
+ * Native iOS adaptation of pixeltris/TwitchAdSolutions VAFT v24.
  * The original project is MIT licensed; see LICENSE-TwitchAdSolutions.
  *
  * This intentionally uses the Objective-C runtime instead of private Twitch
- * symbols. That makes the interception points Foundation/AVFoundation APIs:
- * GraphQL requests are normalized through NSURLProtocol, and Twitch HLS is
- * loaded through an AVAssetResourceLoader delegate.
+ * symbols. Twitch's Amazon IVS player and AVFoundation playback are both
+ * covered: GraphQL and HLS requests are normalized through NSURLProtocol,
+ * with AVAssetResourceLoader retained as a compatibility path.
  */
 
 #include <objc/objc.h>
@@ -29,6 +29,10 @@ typedef long NSInteger;
 #define TAS_SCHEME "tashttps"
 #define TAS_CLIENT_ID "kimne78kx3ncx6brgo4mv6wki5h1ko"
 #define TAS_TOKEN_HASH "ed230aa1e33e07eebb8928504583da78a5173989fadfb1ac94be06a04f3cdbe9"
+#define TAS_PLAYER_TYPE_COUNT 3
+#define TAS_MAX_AD_SEGMENTS 256
+#define TAS_MANIFEST_CAPACITY 262144
+#define TAS_URL_CAPACITY 8192
 
 extern id objc_retain(id object);
 extern void objc_release(id object);
@@ -98,17 +102,37 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_authorization[4096];
 static char g_integrity[4096];
 static char g_device_id[512];
+static char g_client_version[512];
+static char g_client_session[512];
 static char g_channel[512];
-static char g_master_url[8192];
-static char g_backup_variant_url[8192];
+static char g_master_url[TAS_URL_CAPACITY];
+static char g_master_manifest[TAS_MANIFEST_CAPACITY];
+static char g_backup_variant_url[TAS_URL_CAPACITY];
+static char g_backup_player_type[64];
 static time_t g_backup_created;
+static const char *g_player_types[TAS_PLAYER_TYPE_COUNT] = {"embed", "popout", "autoplay"};
+static char g_backup_masters[TAS_PLAYER_TYPE_COUNT][TAS_MANIFEST_CAPACITY];
+static char g_backup_master_urls[TAS_PLAYER_TYPE_COUNT][TAS_URL_CAPACITY];
+
+typedef struct {
+    char url[4096];
+    time_t created;
+} TASAdSegment;
+
+static TASAdSegment g_ad_segments[TAS_MAX_AD_SEGMENTS];
+static size_t g_next_ad_segment;
 
 static char g_association_key;
 static IMP g_original_asset_init;
 static IMP g_original_default_configuration;
 static IMP g_original_ephemeral_configuration;
+static IMP g_original_session_with_configuration;
+static IMP g_original_session_with_configuration_delegate_queue;
 static Class g_protocol_class;
 static Class g_loader_class;
+
+static char *absolute_url(const char *base, const char *relative);
+static char *process_manifest(const char *url, const char *playlist, bool custom_scheme);
 
 static void copy_string(char *destination, size_t capacity, const char *source) {
     if (!destination || capacity == 0) return;
@@ -124,6 +148,49 @@ static bool contains(const char *value, const char *needle) {
     return value && needle && strstr(value, needle) != NULL;
 }
 
+static bool is_twitch_hls_url(const char *url) {
+    return url && contains(url, ".m3u8") &&
+           (contains(url, "ttvnw.net") || contains(url, "twitch.tv"));
+}
+
+static bool is_cached_ad_segment(const char *url) {
+    bool found = false;
+    time_t now = time(NULL);
+    pthread_mutex_lock(&g_lock);
+    for (size_t i = 0; i < TAS_MAX_AD_SEGMENTS; i++) {
+        if (g_ad_segments[i].created && now - g_ad_segments[i].created > 120) {
+            g_ad_segments[i].url[0] = '\0';
+            g_ad_segments[i].created = 0;
+        }
+        if (g_ad_segments[i].url[0] && strcmp(g_ad_segments[i].url, url) == 0) {
+            found = true;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return found;
+}
+
+static void remember_ad_segment(const char *base_url, const char *segment_url) {
+    if (!segment_url || !segment_url[0]) return;
+    char cleaned[4096];
+    copy_string(cleaned, sizeof(cleaned), segment_url);
+    size_t cleaned_length = strlen(cleaned);
+    while (cleaned_length && (cleaned[cleaned_length - 1] == '\r' || cleaned[cleaned_length - 1] == '\n')) {
+        cleaned[--cleaned_length] = '\0';
+    }
+    char *absolute = absolute_url(base_url, cleaned);
+    if (!absolute || strlen(absolute) >= sizeof(g_ad_segments[0].url)) {
+        free(absolute);
+        return;
+    }
+    pthread_mutex_lock(&g_lock);
+    size_t index = g_next_ad_segment++ % TAS_MAX_AD_SEGMENTS;
+    copy_string(g_ad_segments[index].url, sizeof(g_ad_segments[index].url), absolute);
+    g_ad_segments[index].created = time(NULL);
+    pthread_mutex_unlock(&g_lock);
+    free(absolute);
+}
+
 static char *copy_data_text(id data) {
     if (!data) return NULL;
     size_t length = data_length(data);
@@ -137,15 +204,6 @@ static void cache_header(id request, const char *header, char *destination, size
     id value = msg1(request, "valueForHTTPHeaderField:", nsstr(header));
     const char *string = utf8(value);
     if (string && string[0]) copy_string(destination, capacity, string);
-}
-
-static void cache_twitch_headers(id request) {
-    pthread_mutex_lock(&g_lock);
-    cache_header(request, "Authorization", g_authorization, sizeof(g_authorization));
-    cache_header(request, "Client-Integrity", g_integrity, sizeof(g_integrity));
-    cache_header(request, "X-Device-Id", g_device_id, sizeof(g_device_id));
-    if (!g_device_id[0]) cache_header(request, "Device-ID", g_device_id, sizeof(g_device_id));
-    pthread_mutex_unlock(&g_lock);
 }
 
 static bool json_space(char value) {
@@ -224,18 +282,24 @@ static char *replace_json_string(char *source, const char *key, const char *repl
     return result;
 }
 
-static id normalized_graphql_body(id body) {
-    char *json = copy_data_text(body);
-    if (!json) return body;
-    if (!(contains(json, "PlaybackAccessToken") || contains(json, "StreamAccessToken") ||
-          contains(json, "streamPlaybackAccessToken"))) {
-        free(json);
-        return body;
+static char *remove_query_parameter(const char *url, const char *name) {
+    const char *question = strchr(url, '?');
+    if (!question) return strdup(url);
+    size_t base_length = (size_t)(question - url);
+    char *result = calloc(strlen(url) + 1, 1);
+    memcpy(result, url, base_length);
+    char *query = strdup(question + 1);
+    char *save = NULL;
+    bool first = true;
+    size_t name_length = strlen(name);
+    for (char *item = strtok_r(query, "&", &save); item; item = strtok_r(NULL, "&", &save)) {
+        if (strncmp(item, name, name_length) == 0 && item[name_length] == '=') continue;
+        strcat(result, first ? "?" : "&");
+        strcat(result, item);
+        first = false;
     }
-    json = replace_json_string(json, "playerType", "popout");
-    id result = data_from_bytes(json, strlen(json));
-    free(json);
-    return result ?: body;
+    free(query);
+    return result;
 }
 
 static id make_internal_request(const char *url, const char *method) {
@@ -252,26 +316,101 @@ static id synchronous_request(id request, id *response, id *error) {
         request, response, error);
 }
 
+static id blank_video_data(void) {
+    static const char encoded[] =
+        "AAAAKGZ0eXBtcDQyAAAAAWlzb21tcDQyZGFzaGF2YzFpc282aGxzZgAABEltb292AAAAbG12aGQAAAAAAAAAAAAAAAAAAYagAAAAAAABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADAAABqHRyYWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAURtZGlhAAAAIG1kaGQAAAAAAAAAAAAAAAAAALuAAAAAAFXEAAAAAAAtaGRscgAAAAAAAAAAc291bgAAAAAAAAAAAAAAAFNvdW5kSGFuZGxlcgAAAADvbWluZgAAABBzbWhkAAAAAAAAAAAAAAAkZGluZgAAABxkcmVmAAAAAAAAAAEAAAAMdXJsIAAAAAEAAACzc3RibAAAAGdzdHNkAAAAAAAAAAEAAABXbXA0YQAAAAAAAAABAAAAAAAAAAAAAgAQAAAAALuAAAAAAAAzZXNkcwAAAAADgICAIgABAASAgIAUQBUAAAAAAAAAAAAAAAWAgIACEZAGgICAAQIAAAAQc3R0cwAAAAAAAAAAAAAAEHN0c2MAAAAAAAAAAAAAABRzdHN6AAAAAAAAAAAAAAAAAAAAEHN0Y28AAAAAAAAAAAAAAeV0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAoAAAAFoAAAAAAGBbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAA9CQAAAAABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABLG1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAOxzdGJsAAAAoHN0c2QAAAAAAAAAAQAAAJBhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAoABaABIAAAASAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGP//AAAAOmF2Y0MBTUAe/+EAI2dNQB6WUoFAX/LgLUBAQFAAAD6AAA6mDgAAHoQAA9CW7y4KAQAEaOuPIAAAABBzdHRzAAAAAAAAAAAAAAAQc3RzYwAAAAAAAAAAAAAAFHN0c3oAAAAAAAAAAAAAAAAAAAAQc3RjbwAAAAAAAAAAAAAASG12ZXgAAAAgdHJleAAAAAAAAAABAAAAAQAAAC4AAAAAAoAAAAAAACB0cmV4AAAAAAAAAAIAAAABAACCNQAAAAACQAAA";
+    return ((id (*)(id, SEL, id, NSUInteger))objc_msgSend)(
+        (id)objc_getClass("NSData"), sel_registerName("dataWithBase64EncodedString:options:"),
+        nsstr(encoded), 0);
+}
+
+static id http_response(const char *url, NSInteger status, const char *mime, size_t length, id original) {
+    id original_headers = original ? msg0(original, "allHeaderFields") : nil;
+    id headers = original_headers ? msg0(original_headers, "mutableCopy") :
+                                   msg0((id)objc_getClass("NSMutableDictionary"), "dictionary");
+    char length_string[64];
+    snprintf(length_string, sizeof(length_string), "%zu", length);
+    vmsg2(headers, "setObject:forKey:", nsstr(length_string), nsstr("Content-Length"));
+    vmsg2(headers, "setObject:forKey:", nsstr(mime), nsstr("Content-Type"));
+    id response = msg0((id)objc_getClass("NSHTTPURLResponse"), "alloc");
+    response = ((id (*)(id, SEL, id, NSInteger, id, id))objc_msgSend)(
+        response, sel_registerName("initWithURL:statusCode:HTTPVersion:headerFields:"),
+        nsurl(url), status, nsstr("HTTP/1.1"), headers);
+    if (original_headers) objc_release(headers);
+    return response;
+}
+
 static void protocol_start_loading(id self, SEL command) {
     (void)command;
     id original = msg0(self, "request");
+    const char *original_url = utf8(msg0(msg0(original, "URL"), "absoluteString"));
+    id client = msg0(self, "client");
+
+    if (original_url && is_cached_ad_segment(original_url)) {
+        id data = blank_video_data();
+        id response = http_response(original_url, 200, "video/mp4", data_length(data), nil);
+        vmsg3(client, "URLProtocol:didReceiveResponse:cacheStoragePolicy:", self, response, 0);
+        vmsg2(client, "URLProtocol:didLoadData:", self, data);
+        vmsg1(client, "URLProtocolDidFinishLoading:", self);
+        objc_release(response);
+        return;
+    }
+
     id request = msg0(original, "mutableCopy");
     vmsg2(request, "setValue:forHTTPHeaderField:", nsstr("1"), nsstr(TAS_INTERNAL_HEADER));
-    cache_twitch_headers(request);
+    if (original_url && contains(original_url, "/channel/hls/")) {
+        char *network_url = remove_query_parameter(original_url, "parent_domains");
+        vmsg1(request, "setURL:", nsurl(network_url));
+        free(network_url);
+    }
+    pthread_mutex_lock(&g_lock);
+    cache_header(request, "Authorization", g_authorization, sizeof(g_authorization));
+    cache_header(request, "Client-Integrity", g_integrity, sizeof(g_integrity));
+    cache_header(request, "X-Device-Id", g_device_id, sizeof(g_device_id));
+    if (!g_device_id[0]) cache_header(request, "Device-ID", g_device_id, sizeof(g_device_id));
+    cache_header(request, "Client-Version", g_client_version, sizeof(g_client_version));
+    cache_header(request, "Client-Session-Id", g_client_session, sizeof(g_client_session));
+    pthread_mutex_unlock(&g_lock);
     id body = msg0(request, "HTTPBody");
-    if (body) vmsg1(request, "setHTTPBody:", normalized_graphql_body(body));
+    if (body) {
+        char *json = copy_data_text(body);
+        if (json && (contains(json, "PlaybackAccessToken") || contains(json, "StreamAccessToken") ||
+                     contains(json, "streamPlaybackAccessToken"))) {
+            json = replace_json_string(json, "playerType", "popout");
+            id result = data_from_bytes(json, strlen(json));
+            if (result) body = result;
+        }
+        free(json);
+        vmsg1(request, "setHTTPBody:", body);
+    }
 
     id response = nil;
     id error = nil;
     id data = synchronous_request(request, &response, &error);
-    id client = msg0(self, "client");
-    if (error || !response) {
+    id output_data = data;
+    id output_response = response;
+    id rewritten_response = nil;
+    if (!error && data && response && original_url && is_twitch_hls_url(original_url)) {
+        char *text = copy_data_text(data);
+        if (text && starts_with(text, "#EXTM3U")) {
+            char *processed = process_manifest(original_url, text, false);
+            output_data = data_from_bytes(processed, strlen(processed));
+            rewritten_response = http_response(original_url, imsg0(response, "statusCode"),
+                                               "application/vnd.apple.mpegurl",
+                                               data_length(output_data), response);
+            output_response = rewritten_response;
+            free(processed);
+        }
+        free(text);
+    }
+    if (error || !output_response) {
         vmsg2(client, "URLProtocol:didFailWithError:", self, error);
     } else {
-        vmsg3(client, "URLProtocol:didReceiveResponse:cacheStoragePolicy:", self, response, 0);
-        if (data) vmsg2(client, "URLProtocol:didLoadData:", self, data);
+        vmsg3(client, "URLProtocol:didReceiveResponse:cacheStoragePolicy:", self, output_response, 0);
+        if (output_data) vmsg2(client, "URLProtocol:didLoadData:", self, output_data);
         vmsg1(client, "URLProtocolDidFinishLoading:", self);
     }
+    if (rewritten_response) objc_release(rewritten_response);
     objc_release(request);
 }
 
@@ -285,8 +424,8 @@ static BOOL protocol_can_init(id self, SEL command, id request) {
     (void)command;
     if (msg1(request, "valueForHTTPHeaderField:", nsstr(TAS_INTERNAL_HEADER))) return NO;
     id url = msg0(request, "URL");
-    const char *host = utf8(msg0(url, "host"));
-    return host && strcmp(host, "gql.twitch.tv") == 0;
+    const char *absolute = utf8(msg0(url, "absoluteString"));
+    return is_twitch_hls_url(absolute) || is_cached_ad_segment(absolute);
 }
 
 static id protocol_canonical_request(id self, SEL command, id request) {
@@ -351,6 +490,13 @@ static void parse_attribute(const char *line, const char *name, char *output, si
     output[length] = '\0';
 }
 
+static void trim_manifest_line(char *line) {
+    size_t length = strlen(line);
+    while (length && (line[length - 1] == '\r' || line[length - 1] == '\n')) {
+        line[--length] = '\0';
+    }
+}
+
 static void channel_from_master_url(const char *url, char *output, size_t capacity) {
     output[0] = '\0';
     const char *marker = strstr(url, "/channel/hls/");
@@ -372,6 +518,7 @@ static bool variant_metadata(const char *master, const char *variant_url,
     char *previous = NULL;
     bool found = false;
     for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        trim_manifest_line(line);
         if (line[0] != '#' && contains(line, ".m3u8")) {
             char *absolute = absolute_url(g_master_url, line);
             if (strcmp(absolute, variant_url) == 0 && previous && starts_with(previous, "#EXT-X-STREAM-INF")) {
@@ -394,17 +541,23 @@ static char *variant_for_resolution(const char *master, const char *master_url,
     char *copy = strdup(master);
     char *save = NULL;
     char *previous = NULL;
-    char *fallback = NULL;
+    char *closest = NULL;
+    long long closest_difference = INT64_MAX;
     char *resolution_match = NULL;
     char *exact = NULL;
+    long long target_area = 0;
+    if (resolution && resolution[0]) {
+        char *separator = strchr(resolution, 'x');
+        if (separator) target_area = strtoll(resolution, NULL, 10) * strtoll(separator + 1, NULL, 10);
+    }
     for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        trim_manifest_line(line);
         if (line[0] != '#' && contains(line, ".m3u8") && previous && starts_with(previous, "#EXT-X-STREAM-INF")) {
             char line_resolution[128];
             char line_framerate[64];
             parse_attribute(previous, "RESOLUTION=", line_resolution, sizeof(line_resolution));
             parse_attribute(previous, "FRAME-RATE=", line_framerate, sizeof(line_framerate));
             char *absolute = absolute_url(master_url, line);
-            if (!fallback) fallback = strdup(absolute);
             if (resolution[0] && strcmp(line_resolution, resolution) == 0) {
                 if (!resolution_match) resolution_match = strdup(absolute);
                 if (!framerate[0] || strcmp(line_framerate, framerate) == 0) {
@@ -413,13 +566,21 @@ static char *variant_for_resolution(const char *master, const char *master_url,
                     break;
                 }
             }
+            char *separator = strchr(line_resolution, 'x');
+            long long area = separator ? strtoll(line_resolution, NULL, 10) * strtoll(separator + 1, NULL, 10) : 0;
+            long long difference = target_area && area ? llabs(area - target_area) : 0;
+            if (!closest || difference < closest_difference) {
+                free(closest);
+                closest = strdup(absolute);
+                closest_difference = difference;
+            }
             free(absolute);
         }
         previous = line;
     }
-    char *result = exact ?: resolution_match ?: fallback;
+    char *result = exact ?: resolution_match ?: closest;
     if (result != resolution_match) free(resolution_match);
-    if (result != fallback) free(fallback);
+    if (result != closest) free(closest);
     free(copy);
     return result;
 }
@@ -506,6 +667,8 @@ static bool request_access_token(const char *channel, const char *player_type,
     if (g_device_id[0]) vmsg2(request, "setValue:forHTTPHeaderField:", nsstr(g_device_id), nsstr("X-Device-Id"));
     if (g_authorization[0]) vmsg2(request, "setValue:forHTTPHeaderField:", nsstr(g_authorization), nsstr("Authorization"));
     if (g_integrity[0]) vmsg2(request, "setValue:forHTTPHeaderField:", nsstr(g_integrity), nsstr("Client-Integrity"));
+    if (g_client_version[0]) vmsg2(request, "setValue:forHTTPHeaderField:", nsstr(g_client_version), nsstr("Client-Version"));
+    if (g_client_session[0]) vmsg2(request, "setValue:forHTTPHeaderField:", nsstr(g_client_session), nsstr("Client-Session-Id"));
     pthread_mutex_unlock(&g_lock);
     vmsg1(request, "setHTTPBody:", data_from_bytes(json, strlen(json)));
 
@@ -528,64 +691,145 @@ static bool request_access_token(const char *channel, const char *player_type,
 }
 
 static bool has_ad_markers(const char *playlist) {
-    return contains(playlist, "stitched-ad") || contains(playlist, "twitch-stitched-ad") ||
+    return contains(playlist, "stitched") ||
            contains(playlist, "\"MIDROLL\"") || contains(playlist, "\"midroll\"");
 }
 
-static char *fetch_clean_variant(const char *original_master, const char *channel,
-                                 const char *resolution, const char *framerate) {
-    const char *player_types[] = {"autoplay", "picture-by-picture", "embed"};
-    for (size_t i = 0; i < sizeof(player_types) / sizeof(player_types[0]); i++) {
-        char signature[4096];
-        char token[16384];
-        if (!request_access_token(channel, player_types[i], signature, sizeof(signature), token, sizeof(token))) continue;
-        char *master_url = usher_with_token(original_master, signature, token);
-        id master_data = nil;
-        id master_response = nil;
-        if (!fetch_bytes(master_url, &master_data, &master_response)) {
-            free(master_url);
-            continue;
-        }
-        char *master = copy_data_text(master_data);
-        char *variant_url = variant_for_resolution(master, master_url, resolution, framerate);
-        id variant_data = nil;
-        id variant_response = nil;
-        bool loaded = variant_url && fetch_bytes(variant_url, &variant_data, &variant_response);
-        char *variant = loaded ? copy_data_text(variant_data) : NULL;
-        free(master);
-        free(master_url);
-        if (variant && !has_ad_markers(variant)) {
-            pthread_mutex_lock(&g_lock);
-            copy_string(g_backup_variant_url, sizeof(g_backup_variant_url), variant_url);
-            g_backup_created = time(NULL);
-            pthread_mutex_unlock(&g_lock);
-            fprintf(stderr, "[TAS] Switched %s to clean %s HLS\n", channel, player_types[i]);
-            free(variant_url);
-            return variant;
-        }
-        free(variant_url);
-        free(variant);
+static void clear_backup_master(size_t index) {
+    pthread_mutex_lock(&g_lock);
+    g_backup_masters[index][0] = '\0';
+    g_backup_master_urls[index][0] = '\0';
+    pthread_mutex_unlock(&g_lock);
+}
+
+static char *load_backup_master(const char *original_master, const char *channel, size_t index,
+                                bool *was_cached, char **master_url_out) {
+    *was_cached = false;
+    *master_url_out = NULL;
+    pthread_mutex_lock(&g_lock);
+    if (g_backup_masters[index][0] && g_backup_master_urls[index][0]) {
+        *was_cached = true;
+        char *master = strdup(g_backup_masters[index]);
+        *master_url_out = strdup(g_backup_master_urls[index]);
+        pthread_mutex_unlock(&g_lock);
+        return master;
     }
+    pthread_mutex_unlock(&g_lock);
+
+    char signature[4096];
+    char token[16384];
+    if (!request_access_token(channel, g_player_types[index], signature, sizeof(signature), token, sizeof(token))) {
+        return NULL;
+    }
+    char *master_url = usher_with_token(original_master, signature, token);
+    id master_data = nil;
+    id master_response = nil;
+    if (!fetch_bytes(master_url, &master_data, &master_response)) {
+        free(master_url);
+        return NULL;
+    }
+    char *master = copy_data_text(master_data);
+    if (!master) {
+        free(master_url);
+        return NULL;
+    }
+    if (strlen(master) < TAS_MANIFEST_CAPACITY && strlen(master_url) < TAS_URL_CAPACITY) {
+        pthread_mutex_lock(&g_lock);
+        copy_string(g_backup_masters[index], sizeof(g_backup_masters[index]), master);
+        copy_string(g_backup_master_urls[index], sizeof(g_backup_master_urls[index]), master_url);
+        pthread_mutex_unlock(&g_lock);
+    }
+    *master_url_out = master_url;
+    return master;
+}
+
+static char *fetch_vaft_variant(const char *original_master, const char *channel,
+                                const char *resolution, const char *framerate,
+                                char **selected_base_out) {
+    char *fallback = NULL;
+    char *fallback_url = NULL;
+    const char *fallback_type = NULL;
+    *selected_base_out = NULL;
+
+    for (size_t player_index = 0; player_index < TAS_PLAYER_TYPE_COUNT; player_index++) {
+        for (size_t attempt = 0; attempt < 2; attempt++) {
+            bool was_cached = false;
+            char *master_url = NULL;
+            char *master = load_backup_master(original_master, channel, player_index, &was_cached, &master_url);
+            if (!master || !master_url) {
+                free(master);
+                free(master_url);
+                break;
+            }
+            char *variant_url = variant_for_resolution(master, master_url, resolution, framerate);
+            free(master);
+            free(master_url);
+
+            id variant_data = nil;
+            id variant_response = nil;
+            bool loaded = variant_url && fetch_bytes(variant_url, &variant_data, &variant_response);
+            char *variant = loaded ? copy_data_text(variant_data) : NULL;
+            bool has_ads = !variant || has_ad_markers(variant);
+
+            if (variant && player_index == 0) {
+                free(fallback);
+                free(fallback_url);
+                fallback = strdup(variant);
+                fallback_url = strdup(variant_url);
+                fallback_type = g_player_types[player_index];
+            } else if (variant && player_index == TAS_PLAYER_TYPE_COUNT - 1 && !fallback) {
+                fallback = strdup(variant);
+                fallback_url = strdup(variant_url);
+                fallback_type = g_player_types[player_index];
+            }
+
+            if (!has_ads) {
+                pthread_mutex_lock(&g_lock);
+                copy_string(g_backup_variant_url, sizeof(g_backup_variant_url), variant_url);
+                copy_string(g_backup_player_type, sizeof(g_backup_player_type), g_player_types[player_index]);
+                g_backup_created = time(NULL);
+                pthread_mutex_unlock(&g_lock);
+                fprintf(stderr, "[TAS] VAFT switched %s to clean %s HLS\n", channel, g_player_types[player_index]);
+                free(fallback);
+                free(fallback_url);
+                *selected_base_out = variant_url;
+                return variant;
+            }
+
+            free(variant);
+            free(variant_url);
+            clear_backup_master(player_index);
+            if (!was_cached) break;
+        }
+    }
+
+    if (fallback) {
+        fprintf(stderr, "[TAS] VAFT using %s fallback with stitched segments suppressed\n",
+                fallback_type ?: "last-resort");
+        *selected_base_out = fallback_url;
+        return fallback;
+    }
+    free(fallback_url);
     return NULL;
 }
 
-static char *strip_ad_segments(const char *playlist) {
+static char *strip_ad_segments(const char *playlist, const char *base_url) {
     char *copy = strdup(playlist);
     char *result = NULL;
     size_t length = 0;
     size_t capacity = 0;
     char *save = NULL;
-    bool drop_next_uri = false;
+    bool cache_next_uri = false;
     for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-        if (drop_next_uri && line[0] != '#') {
-            drop_next_uri = false;
-            continue;
+        trim_manifest_line(line);
+        if (cache_next_uri && line[0] != '#') {
+            remember_ad_segment(base_url, line);
+            cache_next_uri = false;
         }
         if (starts_with(line, "#EXTINF") && !contains(line, ",live")) {
-            drop_next_uri = true;
-            continue;
+            cache_next_uri = true;
         }
-        if (starts_with(line, "#EXT-X-TWITCH-PREFETCH:") || contains(line, "stitched-ad")) continue;
+        if (starts_with(line, "#EXT-X-TWITCH-PREFETCH:")) continue;
         append_text(&result, &length, &capacity, line);
         append_text(&result, &length, &capacity, "\n");
     }
@@ -593,26 +837,31 @@ static char *strip_ad_segments(const char *playlist) {
     return result ?: strdup("#EXTM3U\n");
 }
 
-static char *rewrite_manifest_urls(const char *playlist, const char *base_url) {
+static char *playback_url(const char *absolute, bool custom_scheme) {
+    return custom_scheme ? custom_scheme_url(absolute) : strdup(absolute);
+}
+
+static char *rewrite_manifest_urls(const char *playlist, const char *base_url, bool custom_scheme) {
     char *copy = strdup(playlist);
     char *result = NULL;
     size_t length = 0;
     size_t capacity = 0;
     char *save = NULL;
     for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        trim_manifest_line(line);
         if (line[0] != '#' && line[0]) {
             char *absolute = absolute_url(base_url, line);
-            char *custom = custom_scheme_url(absolute);
-            append_text(&result, &length, &capacity, custom);
-            free(custom);
+            char *playable = playback_url(absolute, custom_scheme);
+            append_text(&result, &length, &capacity, playable);
+            free(playable);
             free(absolute);
         } else if (starts_with(line, "#EXT-X-TWITCH-PREFETCH:")) {
             const char *value = line + strlen("#EXT-X-TWITCH-PREFETCH:");
             char *absolute = absolute_url(base_url, value);
-            char *custom = custom_scheme_url(absolute);
+            char *playable = playback_url(absolute, custom_scheme);
             append_text(&result, &length, &capacity, "#EXT-X-TWITCH-PREFETCH:");
-            append_text(&result, &length, &capacity, custom);
-            free(custom);
+            append_text(&result, &length, &capacity, playable);
+            free(playable);
             free(absolute);
         } else {
             char *uri = strstr(line, "URI=\"");
@@ -626,16 +875,16 @@ static char *rewrite_manifest_urls(const char *playlist, const char *base_url) {
                     memcpy(relative, value, size);
                     relative[size] = '\0';
                     char *absolute = absolute_url(base_url, relative);
-                    char *custom = custom_scheme_url(absolute);
+                    char *playable = playback_url(absolute, custom_scheme);
                     char prefix[16384];
                     size_t prefix_length = (size_t)(value - line);
                     if (prefix_length >= sizeof(prefix)) prefix_length = sizeof(prefix) - 1;
                     memcpy(prefix, line, prefix_length);
                     prefix[prefix_length] = '\0';
                     append_text(&result, &length, &capacity, prefix);
-                    append_text(&result, &length, &capacity, custom);
+                    append_text(&result, &length, &capacity, playable);
                     append_text(&result, &length, &capacity, end);
-                    free(custom);
+                    free(playable);
                     free(absolute);
                 } else {
                     append_text(&result, &length, &capacity, line);
@@ -650,16 +899,25 @@ static char *rewrite_manifest_urls(const char *playlist, const char *base_url) {
     return result ?: strdup(playlist);
 }
 
-static char *process_manifest(const char *url, const char *playlist) {
+static char *process_manifest(const char *url, const char *playlist, bool custom_scheme) {
     char channel[512];
     channel_from_master_url(url, channel, sizeof(channel));
     if (channel[0]) {
         pthread_mutex_lock(&g_lock);
+        bool channel_changed = g_channel[0] && strcmp(g_channel, channel) != 0;
         copy_string(g_channel, sizeof(g_channel), channel);
         copy_string(g_master_url, sizeof(g_master_url), url);
+        copy_string(g_master_manifest, sizeof(g_master_manifest), playlist);
         g_backup_variant_url[0] = '\0';
+        g_backup_player_type[0] = '\0';
+        if (channel_changed) {
+            for (size_t i = 0; i < TAS_PLAYER_TYPE_COUNT; i++) {
+                g_backup_masters[i][0] = '\0';
+                g_backup_master_urls[i][0] = '\0';
+            }
+        }
         pthread_mutex_unlock(&g_lock);
-        return rewrite_manifest_urls(playlist, url);
+        return rewrite_manifest_urls(playlist, url, custom_scheme);
     }
 
     char master_url[8192];
@@ -667,26 +925,25 @@ static char *process_manifest(const char *url, const char *playlist) {
     char resolution[128] = "";
     char framerate[64] = "";
     char backup_url[8192];
+    time_t backup_created = 0;
+    char *master_manifest = NULL;
     pthread_mutex_lock(&g_lock);
     copy_string(master_url, sizeof(master_url), g_master_url);
     copy_string(current_channel, sizeof(current_channel), g_channel);
     copy_string(backup_url, sizeof(backup_url), g_backup_variant_url);
+    backup_created = g_backup_created;
+    if (g_master_manifest[0]) master_manifest = strdup(g_master_manifest);
     pthread_mutex_unlock(&g_lock);
 
-    if (master_url[0]) {
-        id master_data = nil;
-        id master_response = nil;
-        if (fetch_bytes(master_url, &master_data, &master_response)) {
-            char *master = copy_data_text(master_data);
-            variant_metadata(master, url, resolution, sizeof(resolution), framerate, sizeof(framerate));
-            free(master);
-        }
+    if (master_manifest) {
+        variant_metadata(master_manifest, url, resolution, sizeof(resolution), framerate, sizeof(framerate));
+        free(master_manifest);
     }
 
     char *selected = NULL;
     char *selected_base = NULL;
     if (has_ad_markers(playlist)) {
-        if (backup_url[0] && time(NULL) - g_backup_created < 600) {
+        if (backup_url[0] && time(NULL) - backup_created < 600) {
             id backup_data = nil;
             id backup_response = nil;
             if (fetch_bytes(backup_url, &backup_data, &backup_response)) {
@@ -696,30 +953,35 @@ static char *process_manifest(const char *url, const char *playlist) {
                     selected_base = strdup(backup_url);
                 } else {
                     free(candidate);
+                    pthread_mutex_lock(&g_lock);
+                    g_backup_variant_url[0] = '\0';
+                    g_backup_player_type[0] = '\0';
+                    pthread_mutex_unlock(&g_lock);
                 }
             }
         }
         if (!selected && master_url[0] && current_channel[0]) {
-            selected = fetch_clean_variant(master_url, current_channel, resolution, framerate);
-            if (selected) {
-                pthread_mutex_lock(&g_lock);
-                selected_base = strdup(g_backup_variant_url[0] ? g_backup_variant_url : url);
-                pthread_mutex_unlock(&g_lock);
-            }
+            selected = fetch_vaft_variant(master_url, current_channel, resolution, framerate, &selected_base);
         }
         if (!selected) {
-            selected = strip_ad_segments(playlist);
+            selected = strdup(playlist);
             selected_base = strdup(url);
-            fprintf(stderr, "[TAS] All alternate players had ads; stripping stitched segments\n");
+            fprintf(stderr, "[TAS] VAFT alternates unavailable; suppressing stitched segments\n");
+        }
+        if (has_ad_markers(selected)) {
+            char *stripped = strip_ad_segments(selected, selected_base);
+            free(selected);
+            selected = stripped;
         }
     } else {
         pthread_mutex_lock(&g_lock);
         g_backup_variant_url[0] = '\0';
+        g_backup_player_type[0] = '\0';
         pthread_mutex_unlock(&g_lock);
         selected = strdup(playlist);
         selected_base = strdup(url);
     }
-    char *rewritten = rewrite_manifest_urls(selected, selected_base);
+    char *rewritten = rewrite_manifest_urls(selected, selected_base, custom_scheme);
     free(selected);
     free(selected_base);
     return rewritten;
@@ -739,7 +1001,14 @@ static BOOL loader_handle(id self, SEL command, id loading_request) {
 
     id response = nil;
     id error = nil;
-    id data = synchronous_request(network_request, &response, &error);
+    bool is_synthetic = is_cached_ad_segment(url);
+    id data = nil;
+    if (is_synthetic) {
+        data = blank_video_data();
+        response = http_response(url, 200, "video/mp4", data_length(data), nil);
+    } else {
+        data = synchronous_request(network_request, &response, &error);
+    }
     if (error || !data || !response) {
         vmsg1(loading_request, "finishLoadingWithError:", error);
         objc_release(network_request);
@@ -753,7 +1022,7 @@ static BOOL loader_handle(id self, SEL command, id loading_request) {
     if (contains(url, ".m3u8") || (mime && contains(mime, "mpegurl"))) {
         text = copy_data_text(data);
         if (text && starts_with(text, "#EXTM3U")) {
-            char *processed = process_manifest(url, text);
+            char *processed = process_manifest(url, text, true);
             output_data = data_from_bytes(processed, strlen(processed));
             free(processed);
         }
@@ -771,6 +1040,7 @@ static BOOL loader_handle(id self, SEL command, id loading_request) {
     id data_request = msg0(loading_request, "dataRequest");
     if (data_request) vmsg1(data_request, "respondWithData:", output_data);
     msg0(loading_request, "finishLoading");
+    if (is_synthetic) objc_release(response);
     objc_release(network_request);
     free(url);
     return YES;
@@ -825,6 +1095,18 @@ static id ephemeral_configuration(id self, SEL command) {
     return result;
 }
 
+static id session_with_configuration(id self, SEL command, id configuration) {
+    add_protocol_to_configuration(configuration);
+    return ((id (*)(id, SEL, id))g_original_session_with_configuration)(self, command, configuration);
+}
+
+static id session_with_configuration_delegate_queue(id self, SEL command, id configuration,
+                                                     id delegate, id queue) {
+    add_protocol_to_configuration(configuration);
+    return ((id (*)(id, SEL, id, id, id))g_original_session_with_configuration_delegate_queue)(
+        self, command, configuration, delegate, queue);
+}
+
 static void swizzle_method(Class cls, const char *selector, IMP replacement, IMP *original, bool class_method) {
     Method method = class_method ? class_getClassMethod(cls, sel_registerName(selector)) :
                                    class_getInstanceMethod(cls, sel_registerName(selector));
@@ -863,5 +1145,12 @@ static void tas_initialize(void) {
                    &g_original_default_configuration, true);
     swizzle_method(configuration, "ephemeralSessionConfiguration", (IMP)ephemeral_configuration,
                    &g_original_ephemeral_configuration, true);
-    fprintf(stderr, "[TAS] TwitchAdSolutions iOS port loaded\n");
+
+    Class session = objc_getClass("NSURLSession");
+    swizzle_method(session, "sessionWithConfiguration:", (IMP)session_with_configuration,
+                   &g_original_session_with_configuration, true);
+    swizzle_method(session, "sessionWithConfiguration:delegate:delegateQueue:",
+                   (IMP)session_with_configuration_delegate_queue,
+                   &g_original_session_with_configuration_delegate_queue, true);
+    fprintf(stderr, "[TAS] TwitchAdSolutions VAFT v24 iOS port loaded\n");
 }

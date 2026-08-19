@@ -1,23 +1,28 @@
 # TwitchAdBlock for iOS
 
-A native iOS adaptation of `video-swap-new.user.js` from
+A native iOS adaptation of `vaft-ublock-origin.js` from
 [pixeltris/TwitchAdSolutions](https://github.com/pixeltris/TwitchAdSolutions),
-pinned to userscript version 1.55 / internal solution version 23.
+pinned to internal VAFT solution version 24.
 
-The exact upstream userscript used for this port is included under
+The exact upstream uBlock Origin script used for this port is included under
 `upstream/`; its provenance and checksum are recorded in `UPSTREAM.md`.
 
 ## Strategy
 
-- Normalizes Twitch live playback-token requests to the `popout` player type.
-- Intercepts Twitch HLS through `AVAssetResourceLoader` without depending on
-  Twitch's private Swift class names.
-- Detects `stitched-ad` playlists and retries `autoplay`,
-  `picture-by-picture`, and `embed` playback-token variants.
-- Selects the alternate HLS rendition matching the current resolution and
-  frame rate.
-- If every alternate still contains ads, removes stitched ad segments and
-  waits for live segments rather than playing the ad media.
+- Requests alternate Twitch playback tokens using VAFT's player types.
+- Intercepts HLS through `NSURLProtocol`, including the bundled Amazon IVS
+  player's session path. `AVAssetResourceLoader` remains as a compatibility
+  path for AVFoundation playback.
+- Detects VAFT's broad `stitched` ad marker and tries `embed`, `popout`, then
+  `autoplay`, matching upstream's priority and fallback behavior.
+- Selects an exact resolution/frame-rate rendition when available, otherwise
+  the closest resolution by pixel area.
+- Caches alternate master playlists and forwards the current Twitch client
+  version, session, integrity, authorization, and device headers when asking
+  for alternate playback tokens.
+- If all alternates still contain ads, identifies the stitched media segments,
+  removes low-latency prefetches, and substitutes VAFT's blank MP4 response for
+  those segment requests.
 
 The dylib is intentionally installed as `Tweach.dylib` so it can replace the
 existing injected dylib without modifying the Twitch executable's Mach-O load
@@ -34,6 +39,16 @@ The module is emitted with a replaceable ad-hoc signature, 16 KiB of Mach-O
 header padding, and a 64 KiB in-place signature reservation in `__LINKEDIT`.
 This lets normal IPA signing tools replace its signature without having to
 restructure or enlarge the dylib.
+
+The final module was exercised against LiveContainer's current ZSign source
+(`b8f2401f95d445fc5ab3698677828feb5d24e038`): both its ad-hoc and
+certificate-backed paths completed in place, with no signature-space
+reallocation.
+
+The IPA must retain the base app's complete `Assets.car`. Twitch force-unwraps
+several signed-in navigation images during scene creation, so a truncated asset
+catalog can launch while logged out and then trap immediately after login even
+though the injected module and its signature are valid.
 
 The injected filename remains `Tweach.dylib` only because the supplied Twitch
 executable already has that load command. The file itself is this project's
