@@ -31,6 +31,9 @@ typedef long NSInteger;
 #define TAS_TOKEN_HASH "ed230aa1e33e07eebb8928504583da78a5173989fadfb1ac94be06a04f3cdbe9"
 #define TAS_PLAYER_TYPE_COUNT 3
 #define TAS_MAX_AD_SEGMENTS 256
+#define TAS_MAX_STREAMS 8
+#define TAS_MAX_VARIANT_ROUTES 256
+#define TAS_STREAM_TTL 1800
 #define TAS_MANIFEST_CAPACITY 262144
 #define TAS_URL_CAPACITY 8192
 
@@ -104,15 +107,47 @@ static char g_integrity[4096];
 static char g_device_id[512];
 static char g_client_version[512];
 static char g_client_session[512];
-static char g_channel[512];
-static char g_master_url[TAS_URL_CAPACITY];
-static char g_master_manifest[TAS_MANIFEST_CAPACITY];
-static char g_backup_variant_url[TAS_URL_CAPACITY];
-static char g_backup_player_type[64];
-static time_t g_backup_created;
 static const char *g_player_types[TAS_PLAYER_TYPE_COUNT] = {"embed", "popout", "autoplay"};
-static char g_backup_masters[TAS_PLAYER_TYPE_COUNT][TAS_MANIFEST_CAPACITY];
-static char g_backup_master_urls[TAS_PLAYER_TYPE_COUNT][TAS_URL_CAPACITY];
+
+typedef struct {
+    bool active;
+    uint64_t generation;
+    time_t last_seen;
+    char channel[512];
+    char *master_url;
+    char *master_manifest;
+    char *backup_variant_url;
+    char backup_player_type[64];
+    time_t backup_created;
+    char *backup_masters[TAS_PLAYER_TYPE_COUNT];
+    char *backup_master_urls[TAS_PLAYER_TYPE_COUNT];
+} TASStreamContext;
+
+typedef struct {
+    char url[TAS_URL_CAPACITY];
+    size_t stream_index;
+    uint64_t generation;
+    time_t last_seen;
+} TASVariantRoute;
+
+typedef struct {
+    size_t index;
+    uint64_t generation;
+    bool valid;
+} TASStreamRef;
+
+typedef struct {
+    TASStreamRef ref;
+    char channel[512];
+    char master_url[TAS_URL_CAPACITY];
+    char backup_variant_url[TAS_URL_CAPACITY];
+    time_t backup_created;
+    char *master_manifest;
+} TASStreamSnapshot;
+
+static TASStreamContext g_streams[TAS_MAX_STREAMS];
+static TASVariantRoute g_variant_routes[TAS_MAX_VARIANT_ROUTES];
+static uint64_t g_next_stream_generation = 1;
 
 typedef struct {
     char url[4096];
@@ -148,6 +183,105 @@ static bool starts_with(const char *value, const char *prefix) {
 
 static bool contains(const char *value, const char *needle) {
     return value && needle && strstr(value, needle) != NULL;
+}
+
+static void replace_owned_string(char **destination, const char *source) {
+    char *replacement = source ? strdup(source) : NULL;
+    if (source && !replacement) return;
+    free(*destination);
+    *destination = replacement;
+}
+
+static bool stream_ref_matches_locked(TASStreamRef ref) {
+    return ref.valid && ref.index < TAS_MAX_STREAMS &&
+           g_streams[ref.index].active &&
+           g_streams[ref.index].generation == ref.generation;
+}
+
+static void clear_routes_for_stream_locked(size_t stream_index) {
+    for (size_t i = 0; i < TAS_MAX_VARIANT_ROUTES; i++) {
+        if (g_variant_routes[i].url[0] && g_variant_routes[i].stream_index == stream_index) {
+            memset(&g_variant_routes[i], 0, sizeof(g_variant_routes[i]));
+        }
+    }
+}
+
+static void clear_active_backup_locked(TASStreamContext *stream) {
+    free(stream->backup_variant_url);
+    stream->backup_variant_url = NULL;
+    stream->backup_player_type[0] = '\0';
+    stream->backup_created = 0;
+}
+
+static void clear_stream_context_locked(size_t stream_index) {
+    TASStreamContext *stream = &g_streams[stream_index];
+    clear_routes_for_stream_locked(stream_index);
+    free(stream->master_url);
+    free(stream->master_manifest);
+    free(stream->backup_variant_url);
+    for (size_t i = 0; i < TAS_PLAYER_TYPE_COUNT; i++) {
+        free(stream->backup_masters[i]);
+        free(stream->backup_master_urls[i]);
+    }
+    memset(stream, 0, sizeof(*stream));
+}
+
+static void prune_streams_locked(time_t now) {
+    for (size_t i = 0; i < TAS_MAX_STREAMS; i++) {
+        if (g_streams[i].active && now - g_streams[i].last_seen > TAS_STREAM_TTL) {
+            clear_stream_context_locked(i);
+        }
+    }
+}
+
+static TASStreamRef update_stream_master_locked(const char *channel, const char *url,
+                                                const char *playlist) {
+    time_t now = time(NULL);
+    prune_streams_locked(now);
+
+    size_t stream_index = TAS_MAX_STREAMS;
+    for (size_t i = 0; i < TAS_MAX_STREAMS; i++) {
+        if (g_streams[i].active && strcmp(g_streams[i].channel, channel) == 0) {
+            stream_index = i;
+            break;
+        }
+    }
+    if (stream_index == TAS_MAX_STREAMS) {
+        for (size_t i = 0; i < TAS_MAX_STREAMS; i++) {
+            if (!g_streams[i].active) {
+                stream_index = i;
+                break;
+            }
+        }
+    }
+    if (stream_index == TAS_MAX_STREAMS) {
+        stream_index = 0;
+        for (size_t i = 1; i < TAS_MAX_STREAMS; i++) {
+            if (g_streams[i].last_seen < g_streams[stream_index].last_seen) stream_index = i;
+        }
+        clear_stream_context_locked(stream_index);
+    }
+
+    TASStreamContext *stream = &g_streams[stream_index];
+    if (!stream->active) {
+        stream->active = true;
+        stream->generation = g_next_stream_generation++;
+        if (!g_next_stream_generation) g_next_stream_generation = 1;
+        copy_string(stream->channel, sizeof(stream->channel), channel);
+    }
+    replace_owned_string(&stream->master_url, url);
+    replace_owned_string(&stream->master_manifest, playlist);
+    clear_active_backup_locked(stream);
+    stream->last_seen = now;
+
+    TASStreamRef ref = {stream_index, stream->generation, true};
+    return ref;
+}
+
+static void clear_active_backup(TASStreamRef ref) {
+    pthread_mutex_lock(&g_lock);
+    if (stream_ref_matches_locked(ref)) clear_active_backup_locked(&g_streams[ref.index]);
+    pthread_mutex_unlock(&g_lock);
 }
 
 static bool is_twitch_hls_url(const char *url) {
@@ -541,7 +675,90 @@ static void channel_from_master_url(const char *url, char *output, size_t capaci
     output[length] = '\0';
 }
 
-static bool variant_metadata(const char *master, const char *variant_url,
+static void add_variant_route_locked(TASStreamRef ref, const char *url, time_t now) {
+    if (!stream_ref_matches_locked(ref) || !url || !url[0] || strlen(url) >= TAS_URL_CAPACITY) return;
+
+    size_t route_index = TAS_MAX_VARIANT_ROUTES;
+    for (size_t i = 0; i < TAS_MAX_VARIANT_ROUTES; i++) {
+        if (g_variant_routes[i].url[0] && strcmp(g_variant_routes[i].url, url) == 0) {
+            route_index = i;
+            break;
+        }
+        if (route_index == TAS_MAX_VARIANT_ROUTES && !g_variant_routes[i].url[0]) route_index = i;
+    }
+    if (route_index == TAS_MAX_VARIANT_ROUTES) {
+        route_index = 0;
+        for (size_t i = 1; i < TAS_MAX_VARIANT_ROUTES; i++) {
+            if (g_variant_routes[i].last_seen < g_variant_routes[route_index].last_seen) route_index = i;
+        }
+    }
+
+    TASVariantRoute *route = &g_variant_routes[route_index];
+    copy_string(route->url, sizeof(route->url), url);
+    route->stream_index = ref.index;
+    route->generation = ref.generation;
+    route->last_seen = now;
+}
+
+static void register_variant_routes_locked(TASStreamRef ref, const char *master_url,
+                                           const char *master) {
+    if (!stream_ref_matches_locked(ref)) return;
+    clear_routes_for_stream_locked(ref.index);
+
+    char *copy = strdup(master);
+    if (!copy) return;
+    time_t now = time(NULL);
+    char *save = NULL;
+    for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        trim_manifest_line(line);
+        if (line[0] != '#' && contains(line, ".m3u8")) {
+            char *absolute = absolute_url(master_url, line);
+            add_variant_route_locked(ref, absolute, now);
+            free(absolute);
+        }
+    }
+    free(copy);
+}
+
+static TASStreamRef stream_for_variant_locked(const char *url) {
+    TASStreamRef invalid = {0, 0, false};
+    time_t now = time(NULL);
+    for (size_t i = 0; i < TAS_MAX_VARIANT_ROUTES; i++) {
+        TASVariantRoute *route = &g_variant_routes[i];
+        if (!route->url[0] || strcmp(route->url, url) != 0) continue;
+        TASStreamRef ref = {route->stream_index, route->generation, true};
+        if (!stream_ref_matches_locked(ref)) {
+            memset(route, 0, sizeof(*route));
+            continue;
+        }
+        route->last_seen = now;
+        g_streams[ref.index].last_seen = now;
+        return ref;
+    }
+    return invalid;
+}
+
+static bool snapshot_stream_for_variant(const char *url, TASStreamSnapshot *snapshot) {
+    memset(snapshot, 0, sizeof(*snapshot));
+    pthread_mutex_lock(&g_lock);
+    TASStreamRef ref = stream_for_variant_locked(url);
+    if (!stream_ref_matches_locked(ref)) {
+        pthread_mutex_unlock(&g_lock);
+        return false;
+    }
+    TASStreamContext *stream = &g_streams[ref.index];
+    snapshot->ref = ref;
+    copy_string(snapshot->channel, sizeof(snapshot->channel), stream->channel);
+    copy_string(snapshot->master_url, sizeof(snapshot->master_url), stream->master_url);
+    copy_string(snapshot->backup_variant_url, sizeof(snapshot->backup_variant_url),
+                stream->backup_variant_url);
+    snapshot->backup_created = stream->backup_created;
+    snapshot->master_manifest = stream->master_manifest ? strdup(stream->master_manifest) : NULL;
+    pthread_mutex_unlock(&g_lock);
+    return snapshot->master_manifest != NULL;
+}
+
+static bool variant_metadata(const char *master, const char *master_url, const char *variant_url,
                              char *resolution, size_t resolution_capacity,
                              char *framerate, size_t framerate_capacity) {
     char *copy = strdup(master);
@@ -551,7 +768,7 @@ static bool variant_metadata(const char *master, const char *variant_url,
     for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
         trim_manifest_line(line);
         if (line[0] != '#' && contains(line, ".m3u8")) {
-            char *absolute = absolute_url(g_master_url, line);
+            char *absolute = absolute_url(master_url, line);
             if (strcmp(absolute, variant_url) == 0 && previous && starts_with(previous, "#EXT-X-STREAM-INF")) {
                 parse_attribute(previous, "RESOLUTION=", resolution, resolution_capacity);
                 parse_attribute(previous, "FRAME-RATE=", framerate, framerate_capacity);
@@ -726,23 +943,37 @@ static bool has_ad_markers(const char *playlist) {
            contains(playlist, "\"MIDROLL\"") || contains(playlist, "\"midroll\"");
 }
 
-static void clear_backup_master(size_t index) {
+static void clear_backup_master(TASStreamRef stream_ref, size_t index) {
     pthread_mutex_lock(&g_lock);
-    g_backup_masters[index][0] = '\0';
-    g_backup_master_urls[index][0] = '\0';
+    if (stream_ref_matches_locked(stream_ref)) {
+        TASStreamContext *stream = &g_streams[stream_ref.index];
+        free(stream->backup_masters[index]);
+        free(stream->backup_master_urls[index]);
+        stream->backup_masters[index] = NULL;
+        stream->backup_master_urls[index] = NULL;
+    }
     pthread_mutex_unlock(&g_lock);
 }
 
-static char *load_backup_master(const char *original_master, const char *channel, size_t index,
+static char *load_backup_master(const char *original_master, const char *channel,
+                                TASStreamRef stream_ref, size_t index,
                                 bool *was_cached, char **master_url_out) {
     *was_cached = false;
     *master_url_out = NULL;
     pthread_mutex_lock(&g_lock);
-    if (g_backup_masters[index][0] && g_backup_master_urls[index][0]) {
+    if (stream_ref_matches_locked(stream_ref) &&
+        g_streams[stream_ref.index].backup_masters[index] &&
+        g_streams[stream_ref.index].backup_master_urls[index]) {
         *was_cached = true;
-        char *master = strdup(g_backup_masters[index]);
-        *master_url_out = strdup(g_backup_master_urls[index]);
+        char *master = strdup(g_streams[stream_ref.index].backup_masters[index]);
+        *master_url_out = strdup(g_streams[stream_ref.index].backup_master_urls[index]);
         pthread_mutex_unlock(&g_lock);
+        if (!master || !*master_url_out) {
+            free(master);
+            free(*master_url_out);
+            *master_url_out = NULL;
+            return NULL;
+        }
         return master;
     }
     pthread_mutex_unlock(&g_lock);
@@ -766,8 +997,10 @@ static char *load_backup_master(const char *original_master, const char *channel
     }
     if (strlen(master) < TAS_MANIFEST_CAPACITY && strlen(master_url) < TAS_URL_CAPACITY) {
         pthread_mutex_lock(&g_lock);
-        copy_string(g_backup_masters[index], sizeof(g_backup_masters[index]), master);
-        copy_string(g_backup_master_urls[index], sizeof(g_backup_master_urls[index]), master_url);
+        if (stream_ref_matches_locked(stream_ref)) {
+            replace_owned_string(&g_streams[stream_ref.index].backup_masters[index], master);
+            replace_owned_string(&g_streams[stream_ref.index].backup_master_urls[index], master_url);
+        }
         pthread_mutex_unlock(&g_lock);
     }
     *master_url_out = master_url;
@@ -776,6 +1009,7 @@ static char *load_backup_master(const char *original_master, const char *channel
 
 static char *fetch_vaft_variant(const char *original_master, const char *channel,
                                 const char *resolution, const char *framerate,
+                                TASStreamRef stream_ref,
                                 char **selected_base_out) {
     char *fallback = NULL;
     char *fallback_url = NULL;
@@ -786,7 +1020,8 @@ static char *fetch_vaft_variant(const char *original_master, const char *channel
         for (size_t attempt = 0; attempt < 2; attempt++) {
             bool was_cached = false;
             char *master_url = NULL;
-            char *master = load_backup_master(original_master, channel, player_index, &was_cached, &master_url);
+            char *master = load_backup_master(original_master, channel, stream_ref, player_index,
+                                              &was_cached, &master_url);
             if (!master || !master_url) {
                 free(master);
                 free(master_url);
@@ -816,9 +1051,14 @@ static char *fetch_vaft_variant(const char *original_master, const char *channel
 
             if (!has_ads) {
                 pthread_mutex_lock(&g_lock);
-                copy_string(g_backup_variant_url, sizeof(g_backup_variant_url), variant_url);
-                copy_string(g_backup_player_type, sizeof(g_backup_player_type), g_player_types[player_index]);
-                g_backup_created = time(NULL);
+                if (stream_ref_matches_locked(stream_ref)) {
+                    TASStreamContext *stream = &g_streams[stream_ref.index];
+                    replace_owned_string(&stream->backup_variant_url, variant_url);
+                    copy_string(stream->backup_player_type, sizeof(stream->backup_player_type),
+                                g_player_types[player_index]);
+                    stream->backup_created = time(NULL);
+                    stream->last_seen = stream->backup_created;
+                }
                 pthread_mutex_unlock(&g_lock);
                 fprintf(stderr, "[TAS] VAFT switched %s to clean %s HLS\n", channel, g_player_types[player_index]);
                 free(fallback);
@@ -829,7 +1069,7 @@ static char *fetch_vaft_variant(const char *original_master, const char *channel
 
             free(variant);
             free(variant_url);
-            clear_backup_master(player_index);
+            clear_backup_master(stream_ref, player_index);
             if (!was_cached) break;
         }
     }
@@ -935,64 +1175,41 @@ static char *process_manifest(const char *url, const char *playlist, bool custom
     channel_from_master_url(url, channel, sizeof(channel));
     if (channel[0]) {
         pthread_mutex_lock(&g_lock);
-        bool channel_changed = g_channel[0] && strcmp(g_channel, channel) != 0;
-        copy_string(g_channel, sizeof(g_channel), channel);
-        copy_string(g_master_url, sizeof(g_master_url), url);
-        copy_string(g_master_manifest, sizeof(g_master_manifest), playlist);
-        g_backup_variant_url[0] = '\0';
-        g_backup_player_type[0] = '\0';
-        if (channel_changed) {
-            for (size_t i = 0; i < TAS_PLAYER_TYPE_COUNT; i++) {
-                g_backup_masters[i][0] = '\0';
-                g_backup_master_urls[i][0] = '\0';
-            }
-        }
+        TASStreamRef stream_ref = update_stream_master_locked(channel, url, playlist);
+        register_variant_routes_locked(stream_ref, url, playlist);
         pthread_mutex_unlock(&g_lock);
         return rewrite_manifest_urls(playlist, url, custom_scheme);
     }
 
-    char master_url[8192];
-    char current_channel[512];
     char resolution[128] = "";
     char framerate[64] = "";
-    char backup_url[8192];
-    time_t backup_created = 0;
-    char *master_manifest = NULL;
-    pthread_mutex_lock(&g_lock);
-    copy_string(master_url, sizeof(master_url), g_master_url);
-    copy_string(current_channel, sizeof(current_channel), g_channel);
-    copy_string(backup_url, sizeof(backup_url), g_backup_variant_url);
-    backup_created = g_backup_created;
-    if (g_master_manifest[0]) master_manifest = strdup(g_master_manifest);
-    pthread_mutex_unlock(&g_lock);
-
-    if (master_manifest) {
-        variant_metadata(master_manifest, url, resolution, sizeof(resolution), framerate, sizeof(framerate));
-        free(master_manifest);
+    TASStreamSnapshot stream;
+    if (!snapshot_stream_for_variant(url, &stream)) {
+        return rewrite_manifest_urls(playlist, url, custom_scheme);
     }
+    variant_metadata(stream.master_manifest, stream.master_url, url,
+                     resolution, sizeof(resolution), framerate, sizeof(framerate));
 
     char *selected = NULL;
     char *selected_base = NULL;
     if (has_ad_markers(playlist)) {
-        if (backup_url[0] && time(NULL) - backup_created < 600) {
+        if (stream.backup_variant_url[0] && time(NULL) - stream.backup_created < 600) {
             id backup_data = nil;
             id backup_response = nil;
-            if (fetch_bytes(backup_url, &backup_data, &backup_response)) {
+            if (fetch_bytes(stream.backup_variant_url, &backup_data, &backup_response)) {
                 char *candidate = copy_data_text(backup_data);
                 if (candidate && !has_ad_markers(candidate)) {
                     selected = candidate;
-                    selected_base = strdup(backup_url);
+                    selected_base = strdup(stream.backup_variant_url);
                 } else {
                     free(candidate);
-                    pthread_mutex_lock(&g_lock);
-                    g_backup_variant_url[0] = '\0';
-                    g_backup_player_type[0] = '\0';
-                    pthread_mutex_unlock(&g_lock);
+                    clear_active_backup(stream.ref);
                 }
             }
         }
-        if (!selected && master_url[0] && current_channel[0]) {
-            selected = fetch_vaft_variant(master_url, current_channel, resolution, framerate, &selected_base);
+        if (!selected && stream.master_url[0] && stream.channel[0]) {
+            selected = fetch_vaft_variant(stream.master_url, stream.channel, resolution, framerate,
+                                          stream.ref, &selected_base);
         }
         if (!selected) {
             selected = strdup(playlist);
@@ -1005,16 +1222,14 @@ static char *process_manifest(const char *url, const char *playlist, bool custom
             selected = stripped;
         }
     } else {
-        pthread_mutex_lock(&g_lock);
-        g_backup_variant_url[0] = '\0';
-        g_backup_player_type[0] = '\0';
-        pthread_mutex_unlock(&g_lock);
+        clear_active_backup(stream.ref);
         selected = strdup(playlist);
         selected_base = strdup(url);
     }
     char *rewritten = rewrite_manifest_urls(selected, selected_base, custom_scheme);
     free(selected);
     free(selected_base);
+    free(stream.master_manifest);
     return rewritten;
 }
 

@@ -19,6 +19,10 @@ The exact upstream uBlock Origin script used for this port is included under
   `autoplay`, matching upstream's priority and fallback behavior.
 - Selects an exact resolution/frame-rate rendition when available, otherwise
   the closest resolution by pixel area.
+- Keeps master playlists, alternate-player caches, and clean variants isolated
+  per channel. Each rendition URL is mapped back to its owning stream so the
+  mobile app's simultaneous PiP and muted profile-preview players cannot reuse
+  one another's VAFT state.
 - Caches alternate master playlists and forwards the current Twitch client
   version, session, integrity, authorization, and device headers when asking
   for alternate playback tokens.
@@ -43,9 +47,9 @@ This lets normal IPA signing tools replace its signature without having to
 restructure or enlarge the dylib.
 
 The final module was exercised against LiveContainer's current ZSign source
-(`b8f2401f95d445fc5ab3698677828feb5d24e038`): both its ad-hoc and
-certificate-backed paths completed in place, with no signature-space
-reallocation.
+(`bbd398fb51e6a9ab71ce6e38f890f45f9c5073c8`): its ad-hoc path completed in
+place without signature-space reallocation. The 64 KiB reservation also leaves
+ample room for the larger certificate-backed signature.
 
 The IPA must retain the base app's complete `Assets.car`. Twitch force-unwraps
 several signed-in navigation images during scene creation, so a truncated asset
@@ -59,6 +63,15 @@ authentication, and DRM are not present in the packaged IPA.
 
 Because Twitch controls the GraphQL and HLS responses, ad-delivery changes can
 require future updates even when the native interception points remain stable.
+
+## Release notes
+
+### 2.0.3
+
+- Replaced the single global stream slot with per-channel VAFT contexts.
+- Associated each media-playlist URL with the master playlist that produced it.
+- Scoped clean variants and alternate master caches to their owning stream,
+  fixing profile previews that could clone the active PiP stream or turn black.
 
 ## Build
 
