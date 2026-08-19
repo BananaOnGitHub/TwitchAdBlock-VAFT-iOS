@@ -1,0 +1,64 @@
+name: Playback bug
+description: Report an ad-blocking, playback, PiP, preview, or launch regression
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not upload an account token, signing certificate, or credential.
+  - type: input
+    id: twitch-version
+    attributes:
+      label: Twitch version
+      placeholder: "30.4.2"
+    validations:
+      required: true
+  - type: input
+    id: ios-version
+    attributes:
+      label: iOS version
+    validations:
+      required: true
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Installation method
+      options:
+        - LiveContainer
+        - KravaSigner
+        - AltStore / SideStore
+        - TrollStore
+        - Jailbreak tweak injection
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: account-state
+    attributes:
+      label: Account state
+      options:
+        - Signed in
+        - Signed out
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Include whether this involved a preroll, midroll, PiP, profile preview, launch, or signing.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I did not attach private credentials.
+          required: true

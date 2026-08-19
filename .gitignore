@@ -1,0 +1,9 @@
+/build/
+/dist/
+/*.ipa
+/*.deb
+/*.p12
+/*.mobileprovision
+__pycache__/
+*.pyc
+.DS_Store

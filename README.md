@@ -1,80 +1,135 @@
-# TwitchAdBlock for iOS
+# TwitchAdBlock-VAFT-iOS
 
-A native iOS adaptation of `vaft-ublock-origin.js` from
-[pixeltris/TwitchAdSolutions](https://github.com/pixeltris/TwitchAdSolutions),
-pinned to internal VAFT solution version 24.
+A native iOS port of the **VAFT** strategy from
+[pixeltris/TwitchAdSolutions](https://github.com/pixeltris/TwitchAdSolutions).
+It supports both sideloaded decrypted copies of Twitch and jailbroken devices.
 
-The exact upstream uBlock Origin script used for this port is included under
-`upstream/`; its provenance and checksum are recorded in `UPSTREAM.md`.
+Releases contain the open-source dylib, IPA releases, an IPA patcher,
+rootful/rootless jailbreak packages, and checksums.
 
-## Strategy
+## Status
 
-- Normalizes Twitch live playback-token requests to the `popout` player type.
-- Mutates only playback-token GraphQL requests at `NSURLSession` task creation,
-  while HLS is intercepted through `NSURLProtocol`, including the bundled
-  Amazon IVS player's session path. Authenticated startup GraphQL responses are
-  never proxied. `AVAssetResourceLoader` remains as a compatibility path for
-  AVFoundation playback.
-- Detects VAFT's broad `stitched` ad marker and tries `embed`, `popout`, then
-  `autoplay`, matching upstream's priority and fallback behavior.
-- Selects an exact resolution/frame-rate rendition when available, otherwise
-  the closest resolution by pixel area.
-- Keeps master playlists, alternate-player caches, and clean variants isolated
-  per channel. Each rendition URL is mapped back to its owning stream so the
-  mobile app's simultaneous PiP and muted profile-preview players cannot reuse
-  one another's VAFT state.
-- Caches alternate master playlists and forwards the current Twitch client
-  version, session, integrity, authorization, and device headers when asking
-  for alternate playback tokens.
-- If all alternates still contain ads, identifies the stitched media segments,
-  removes low-latency prefetches, and substitutes VAFT's blank MP4 response for
-  those segment requests.
+- Port version: **2.1.0**
+- Upstream strategy: **VAFT solution 24**
+- Tested app version: **Twitch 30.4.2, arm64**
+  - Tested on an iPhone 16 Pro on 18.2
+- Tested installation path: LiveContainer/ZSign and ordinary IPA resigning
 
-The dylib is intentionally installed as `Tweach.dylib` so it can replace the
-existing injected dylib without modifying the Twitch executable's Mach-O load
-commands. It contains no Tweach code, DRM, account logic, FFmpeg, or calls to
-the Tweach developer's servers.
+Other Twitch versions may work, but Twitch can change its GraphQL, HLS, or
+Amazon IVS behavior without notice. I haven't tested this on any other devices,
+iOS, or Twitch versions.
 
-## Compatibility
+## What it does
 
-Built against the decrypted Twitch 30.4.2 arm64 IPA supplied for this port.
-The packaged IPA is not distribution-signed and must be signed by the
-sideloading tool or signing service used to install it.
+- Intercepts Twitch playback-token and HLS requests without private Twitch
+  symbols.
+- Tries VAFT's `embed`, `popout`, and `autoplay` player types when an ad-bearing
+  playlist is detected.
+- Matches alternate renditions by resolution and frame rate.
+- Falls back to suppressing stitched ad segments when clean alternates are not
+  available.
+- Maintains isolated state for simultaneous streams, including Twitch mobile's
+  PiP player and muted profile previews.
 
-The module is emitted with a replaceable ad-hoc signature, 16 KiB of Mach-O
-header padding, and a 64 KiB in-place signature reservation in `__LINKEDIT`.
-This lets normal IPA signing tools replace its signature without having to
-restructure or enlarge the dylib.
+The project is completely independent of Tweach. When a Tweach-modified IPA is
+used as a donor solely because it contains a newer decrypted Twitch build, the
+patcher removes `Tweach.dylib` and its Mach-O load command before injecting
+`TwitchAdBlock.dylib`. No Tweach authentication, DRM, account system, or
+developer-server calls remain.
 
-The final module was exercised against LiveContainer's current ZSign source
-(`bbd398fb51e6a9ab71ce6e38f890f45f9c5073c8`): its ad-hoc path completed in
-place without signature-space reallocation. The 64 KiB reservation also leaves
-ample room for the larger certificate-backed signature.
+## Install from a release
 
-The IPA must retain the base app's complete `Assets.car`. Twitch force-unwraps
-several signed-in navigation images during scene creation, so a truncated asset
-catalog can launch while logged out and then trap immediately after login even
-though the injected module and its signature are valid.
+Requirements:
 
-The injected filename remains `Tweach.dylib` only because the supplied Twitch
-executable already has that load command. The file itself is this project's
-small native module; the original Tweach bundle, binary, dependencies,
-authentication, and DRM are not present in the packaged IPA.
+- A decrypted Twitch IPA
+- Python 3.10 or newer
+- A sideloading/signing tool
 
-Because Twitch controls the GraphQL and HLS responses, ad-delivery changes can
-require future updates even when the native interception points remain stable.
+Download the release bundle and run:
 
-## Release notes
+```bash
+python3 tools/patch_ipa.py (TWITCH IPA NAME HERE).ipa \
+  --dylib TwitchAdBlock.dylib \
+  --output Twitch-VAFT.ipa
+```
 
-### 2.0.3
+The resulting IPA is unsigned. Sign `Twitch-VAFT.ipa` with your
+normal sideloading tool before installing it.
 
-- Replaced the single global stream slot with per-channel VAFT contexts.
-- Associated each media-playlist URL with the master playlist that produced it.
-- Scoped clean variants and alternate master caches to their owning stream,
-  fixing profile previews that could clone the active PiP stream or turn black.
+The patcher:
 
-## Build
+- Refuses encrypted executables.
+- Removes the donor's `@rpath/Tweach.dylib` load command and dylib file.
+- Adds `@rpath/TwitchAdBlock.dylib` using existing Mach-O header padding.
+- Updates an existing `TwitchAdBlock.dylib` without duplicate commands.
+- Preserves every unrelated IPA entry and verifies that `Assets.car` is
+  unchanged.
 
-Set `ZIG` to a Zig compiler, `ZIG_LIB` to its `lib` directory, and
-`IOS_STUBS` to this repository's `build-stubs` directory, then run
-`./build.sh`. The output is `build/Tweach.dylib` for arm64 iOS.
+## Install on a jailbroken device
+
+Releases include two standalone packages:
+
+- `iphoneos-arm` for traditional rootful jailbreaks.
+- `iphoneos-arm64` for rootless jailbreaks using the `/var/jb` layout.
+
+Install the package matching the jailbreak, then restart Twitch. The filter is
+scoped to the `tv.twitch` bundle and does not patch the app executable. It can
+therefore be used with the newest Twitch version supported by the device's iOS
+version. The package conflicts with level3tjg's TwitchAdBlock because both
+projects intercept the same playback stack.
+
+## Build from source
+
+Install [Zig 0.14.0](https://ziglang.org/download/0.14.0/) and run:
+
+```bash
+make verify
+make test
+```
+
+To use a Zig binary outside `PATH`:
+
+```bash
+ZIG=/path/to/zig make verify
+```
+
+The output is `build/TwitchAdBlock.dylib`. `make deb` creates rootful and
+rootless packages, while `make release` creates the complete set used by
+GitHub Releases under `dist/`.
+
+## Troubleshooting
+
+### The signer says it cannot sign the dylib
+
+Use the release dylib rather than rebuilding with arbitrary linker settings.
+The build reserves 64 KiB for a replacement code signature and has been tested
+against LiveContainer's ZSign implementation.
+
+### The app launches logged out but crashes after login
+
+Verify that the input IPA contains the complete `Assets.car`. Twitch force-loads
+signed-in navigation assets; a truncated asset catalog can survive the login
+screen and then crash during scene creation. The included patcher refuses an IPA
+with no asset catalog and verifies its CRC after repackaging.
+
+### PiP and profile previews interfere with one another
+
+Upgrade to 2.0.3 or newer. Older native builds used one global VAFT context and
+could substitute one player's clean playlist into another player.
+
+## Repository policy
+
+- Reproduction reports should include the Twitch version, install method, and a
+  description of playback behavior—not account tokens or credentials.
+
+See [Architecture](docs/ARCHITECTURE.md), [Version history](docs/HISTORY.md),
+[Contributing](CONTRIBUTING.md), and [Upstream provenance](UPSTREAM.md) for more
+detail.
+
+## License and attribution
+
+The native port is Apache-2.0 licensed.
+
+This project is not affiliated with Twitch Interactive, Inc., Amazon.com, Inc.,
+pixeltris, level3tjg, or the Tweach project. Twitch is a trademark of its
+respective owner.

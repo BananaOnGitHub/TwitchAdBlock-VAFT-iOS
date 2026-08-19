@@ -1,0 +1,15 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-ios ]
+install-name:    '/usr/lib/libSystem.B.dylib'
+current-version: 1336
+exports:
+  - targets:         [ arm64-ios ]
+    symbols:         [ ___memcpy_chk, ___stderrp, _arc4random_uniform, _bzero,
+                       _calloc, _dispatch_queue_create, _fprintf, _free,
+                       _fwrite, _malloc, _memchr, _memcpy,
+                       _pthread_mutex_lock, _pthread_mutex_unlock, _realloc,
+                       _snprintf, _strcat, _strchr, _strcmp, _strdup, _strlen,
+                       _strncmp, _strstr, _strtok_r, _strtoll, _time,
+                       dyld_stub_binder ]
+...

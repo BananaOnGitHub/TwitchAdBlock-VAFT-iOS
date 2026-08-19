@@ -2,7 +2,7 @@
  * TwitchAdBlock for iOS
  *
  * Native iOS adaptation of pixeltris/TwitchAdSolutions VAFT v24.
- * The original project is MIT licensed; see LICENSE-TwitchAdSolutions.
+ * The original project is MIT licensed.
  *
  * This intentionally uses the Objective-C runtime instead of private Twitch
  * symbols. Twitch's Amazon IVS player and AVFoundation playback are both
