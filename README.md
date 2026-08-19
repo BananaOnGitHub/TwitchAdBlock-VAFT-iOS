@@ -9,10 +9,12 @@ The exact upstream uBlock Origin script used for this port is included under
 
 ## Strategy
 
-- Requests alternate Twitch playback tokens using VAFT's player types.
-- Intercepts HLS through `NSURLProtocol`, including the bundled Amazon IVS
-  player's session path. `AVAssetResourceLoader` remains as a compatibility
-  path for AVFoundation playback.
+- Normalizes Twitch live playback-token requests to the `popout` player type.
+- Mutates only playback-token GraphQL requests at `NSURLSession` task creation,
+  while HLS is intercepted through `NSURLProtocol`, including the bundled
+  Amazon IVS player's session path. Authenticated startup GraphQL responses are
+  never proxied. `AVAssetResourceLoader` remains as a compatibility path for
+  AVFoundation playback.
 - Detects VAFT's broad `stitched` ad marker and tries `embed`, `popout`, then
   `autoplay`, matching upstream's priority and fallback behavior.
 - Selects an exact resolution/frame-rate rendition when available, otherwise

@@ -128,6 +128,8 @@ static IMP g_original_default_configuration;
 static IMP g_original_ephemeral_configuration;
 static IMP g_original_session_with_configuration;
 static IMP g_original_session_with_configuration_delegate_queue;
+static IMP g_original_data_task_request;
+static IMP g_original_data_task_request_completion;
 static Class g_protocol_class;
 static Class g_loader_class;
 
@@ -206,6 +208,17 @@ static void cache_header(id request, const char *header, char *destination, size
     if (string && string[0]) copy_string(destination, capacity, string);
 }
 
+static void cache_twitch_headers(id request) {
+    pthread_mutex_lock(&g_lock);
+    cache_header(request, "Authorization", g_authorization, sizeof(g_authorization));
+    cache_header(request, "Client-Integrity", g_integrity, sizeof(g_integrity));
+    cache_header(request, "X-Device-Id", g_device_id, sizeof(g_device_id));
+    if (!g_device_id[0]) cache_header(request, "Device-ID", g_device_id, sizeof(g_device_id));
+    cache_header(request, "Client-Version", g_client_version, sizeof(g_client_version));
+    cache_header(request, "Client-Session-Id", g_client_session, sizeof(g_client_session));
+    pthread_mutex_unlock(&g_lock);
+}
+
 static bool json_space(char value) {
     return value == ' ' || value == '\t' || value == '\r' || value == '\n';
 }
@@ -280,6 +293,41 @@ static char *replace_json_string(char *source, const char *key, const char *repl
     }
     free(source);
     return result;
+}
+
+static id normalized_graphql_body(id body) {
+    char *json = copy_data_text(body);
+    if (!json) return body;
+    if (!(contains(json, "PlaybackAccessToken") || contains(json, "StreamAccessToken") ||
+          contains(json, "streamPlaybackAccessToken"))) {
+        free(json);
+        return body;
+    }
+    json = replace_json_string(json, "playerType", "popout");
+    id result = data_from_bytes(json, strlen(json));
+    free(json);
+    return result ?: body;
+}
+
+static id normalized_graphql_request_copy(id original) {
+    if (!original) return nil;
+    id url = msg0(original, "URL");
+    const char *host = utf8(msg0(url, "host"));
+    if (!host || strcmp(host, "gql.twitch.tv") != 0) return nil;
+
+    cache_twitch_headers(original);
+    id body = msg0(original, "HTTPBody");
+    if (!body) return nil;
+    char *json = copy_data_text(body);
+    bool is_playback_token = json &&
+        (contains(json, "PlaybackAccessToken") || contains(json, "StreamAccessToken") ||
+         contains(json, "streamPlaybackAccessToken"));
+    free(json);
+    if (!is_playback_token) return nil;
+
+    id request = msg0(original, "mutableCopy");
+    vmsg1(request, "setHTTPBody:", normalized_graphql_body(body));
+    return request;
 }
 
 static char *remove_query_parameter(const char *url, const char *name) {
@@ -363,26 +411,9 @@ static void protocol_start_loading(id self, SEL command) {
         vmsg1(request, "setURL:", nsurl(network_url));
         free(network_url);
     }
-    pthread_mutex_lock(&g_lock);
-    cache_header(request, "Authorization", g_authorization, sizeof(g_authorization));
-    cache_header(request, "Client-Integrity", g_integrity, sizeof(g_integrity));
-    cache_header(request, "X-Device-Id", g_device_id, sizeof(g_device_id));
-    if (!g_device_id[0]) cache_header(request, "Device-ID", g_device_id, sizeof(g_device_id));
-    cache_header(request, "Client-Version", g_client_version, sizeof(g_client_version));
-    cache_header(request, "Client-Session-Id", g_client_session, sizeof(g_client_session));
-    pthread_mutex_unlock(&g_lock);
+    cache_twitch_headers(request);
     id body = msg0(request, "HTTPBody");
-    if (body) {
-        char *json = copy_data_text(body);
-        if (json && (contains(json, "PlaybackAccessToken") || contains(json, "StreamAccessToken") ||
-                     contains(json, "streamPlaybackAccessToken"))) {
-            json = replace_json_string(json, "playerType", "popout");
-            id result = data_from_bytes(json, strlen(json));
-            if (result) body = result;
-        }
-        free(json);
-        vmsg1(request, "setHTTPBody:", body);
-    }
+    if (body) vmsg1(request, "setHTTPBody:", normalized_graphql_body(body));
 
     id response = nil;
     id error = nil;
@@ -1107,6 +1138,22 @@ static id session_with_configuration_delegate_queue(id self, SEL command, id con
         self, command, configuration, delegate, queue);
 }
 
+static id data_task_with_request(id self, SEL command, id original) {
+    id replacement = normalized_graphql_request_copy(original);
+    id task = ((id (*)(id, SEL, id))g_original_data_task_request)(
+        self, command, replacement ?: original);
+    if (replacement) objc_release(replacement);
+    return task;
+}
+
+static id data_task_with_request_completion(id self, SEL command, id original, id completion) {
+    id replacement = normalized_graphql_request_copy(original);
+    id task = ((id (*)(id, SEL, id, id))g_original_data_task_request_completion)(
+        self, command, replacement ?: original, completion);
+    if (replacement) objc_release(replacement);
+    return task;
+}
+
 static void swizzle_method(Class cls, const char *selector, IMP replacement, IMP *original, bool class_method) {
     Method method = class_method ? class_getClassMethod(cls, sel_registerName(selector)) :
                                    class_getInstanceMethod(cls, sel_registerName(selector));
@@ -1152,5 +1199,10 @@ static void tas_initialize(void) {
     swizzle_method(session, "sessionWithConfiguration:delegate:delegateQueue:",
                    (IMP)session_with_configuration_delegate_queue,
                    &g_original_session_with_configuration_delegate_queue, true);
+    swizzle_method(session, "dataTaskWithRequest:", (IMP)data_task_with_request,
+                   &g_original_data_task_request, false);
+    swizzle_method(session, "dataTaskWithRequest:completionHandler:",
+                   (IMP)data_task_with_request_completion,
+                   &g_original_data_task_request_completion, false);
     fprintf(stderr, "[TAS] TwitchAdSolutions VAFT v24 iOS port loaded\n");
 }
