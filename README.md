@@ -30,9 +30,10 @@ Built against the decrypted Twitch 30.4.2 arm64 IPA supplied for this port.
 The packaged IPA is not distribution-signed and must be signed by the
 sideloading tool or signing service used to install it.
 
-The module is emitted with a replaceable ad-hoc signature and 16 KiB of Mach-O
-header padding. This lets normal IPA signing tools replace its signature rather
-than having to restructure an entirely unsigned dylib.
+The module is emitted with a replaceable ad-hoc signature, 16 KiB of Mach-O
+header padding, and a 64 KiB in-place signature reservation in `__LINKEDIT`.
+This lets normal IPA signing tools replace its signature without having to
+restructure or enlarge the dylib.
 
 The injected filename remains `Tweach.dylib` only because the supplied Twitch
 executable already has that load command. The file itself is this project's

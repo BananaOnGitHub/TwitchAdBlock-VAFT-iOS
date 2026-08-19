@@ -20,3 +20,5 @@ mkdir -p build/cache build/global-cache
   -femit-bin=build/Tweach.dylib \
   -cflags -Wall -Wextra -Werror -fvisibility=hidden -- \
   src/TwitchAdBlock.c
+
+python3 tools/reserve_codesign_space.py build/Tweach.dylib --size 65536
