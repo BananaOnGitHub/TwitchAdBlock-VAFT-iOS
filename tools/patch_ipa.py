@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remove donor tweaks and inject VAFT into a user-supplied decrypted Twitch IPA."""
+"""Replace donor tweaks with the VAFT framework in a decrypted Twitch IPA."""
 
 from __future__ import annotations
 
@@ -16,12 +16,16 @@ try:
 except ImportError:  # Direct execution from tools/patch_ipa.py.
     from macho import MachOError, encryption_ids, inject_load_dylib, remove_load_dylibs
 
-LOAD_PATH = "@rpath/TwitchAdBlock.dylib"
-DYLIB_NAME = "TwitchAdBlock.dylib"
-DONOR_DYLIB_NAMES = {"Tweach.dylib"}
+LOAD_PATH = "@rpath/Tweach.framework/Tweach"
+FRAMEWORK_NAME = "Tweach.framework"
+FRAMEWORK_BINARY_NAME = "Tweach"
+DONOR_DYLIB_NAMES = {"Tweach.dylib", "TwitchAdBlock.dylib"}
 DONOR_LOAD_PATHS = {
     "@rpath/Tweach.dylib",
     "@executable_path/Frameworks/Tweach.dylib",
+    "@rpath/TwitchAdBlock.dylib",
+    "@executable_path/Frameworks/TwitchAdBlock.dylib",
+    LOAD_PATH,
 }
 
 
@@ -41,11 +45,19 @@ def _copy_entry(source: zipfile.ZipFile, destination: zipfile.ZipFile, info: zip
         shutil.copyfileobj(incoming, outgoing, length=1024 * 1024)
 
 
-def patch_ipa(input_path: Path, dylib_path: Path, output_path: Path, force: bool = False) -> tuple[bool, list[str]]:
+def patch_ipa(input_path: Path, framework_path: Path, output_path: Path,
+              force: bool = False) -> tuple[bool, list[str]]:
     if not input_path.is_file():
         raise FileNotFoundError(f"input IPA not found: {input_path}")
-    if not dylib_path.is_file():
-        raise FileNotFoundError(f"dylib not found: {dylib_path}")
+    framework_binary_path = framework_path / FRAMEWORK_BINARY_NAME
+    framework_info_path = framework_path / "Info.plist"
+    if not framework_binary_path.is_file():
+        raise FileNotFoundError(f"framework binary not found: {framework_binary_path}")
+    if not framework_info_path.is_file():
+        raise FileNotFoundError(f"framework Info.plist not found: {framework_info_path}")
+    framework_info = plistlib.loads(framework_info_path.read_bytes())
+    if framework_info.get("CFBundleExecutable") != FRAMEWORK_BINARY_NAME:
+        raise ValueError("framework Info.plist has an unexpected CFBundleExecutable")
     if output_path.exists() and not force:
         raise FileExistsError(f"output already exists: {output_path} (use --force to replace it)")
     if input_path.resolve() == output_path.resolve():
@@ -72,7 +84,9 @@ def patch_ipa(input_path: Path, dylib_path: Path, output_path: Path, force: bool
             if not isinstance(executable_name, str) or not executable_name:
                 raise ValueError("Info.plist has no CFBundleExecutable")
             executable_entry = f"{app_root}/{executable_name}"
-            dylib_entry = f"{app_root}/Frameworks/{DYLIB_NAME}"
+            framework_root = f"{app_root}/Frameworks/{FRAMEWORK_NAME}"
+            framework_binary_entry = f"{framework_root}/{FRAMEWORK_BINARY_NAME}"
+            framework_info_entry = f"{framework_root}/Info.plist"
             asset_entry = f"{app_root}/Assets.car"
 
             names = set(source.namelist())
@@ -87,7 +101,8 @@ def patch_ipa(input_path: Path, dylib_path: Path, output_path: Path, force: bool
                 raise ValueError("the app executable is still encrypted; provide a decrypted IPA")
             executable, removed_load_paths = remove_load_dylibs(executable, DONOR_LOAD_PATHS)
             executable, injected = inject_load_dylib(executable, LOAD_PATH)
-            dylib = dylib_path.read_bytes()
+            framework_binary = framework_binary_path.read_bytes()
+            framework_info_bytes = framework_info_path.read_bytes()
 
             donor_entries = {
                 f"{app_root}/Frameworks/{name}" for name in DONOR_DYLIB_NAMES
@@ -97,18 +112,19 @@ def patch_ipa(input_path: Path, dylib_path: Path, output_path: Path, force: bool
                 for item in source.infolist():
                     if item.filename == executable_entry:
                         destination.writestr(item, executable)
-                    elif item.filename in donor_entries:
+                    elif item.filename in donor_entries or item.filename.startswith(framework_root + "/"):
                         continue
-                    elif item.filename == dylib_entry:
-                        destination.writestr(item, dylib)
                     else:
                         _copy_entry(source, destination, item)
 
-                if dylib_entry not in names:
-                    item = zipfile.ZipInfo(dylib_entry)
-                    item.compress_type = zipfile.ZIP_DEFLATED
-                    item.external_attr = 0o100755 << 16
-                    destination.writestr(item, dylib)
+                binary_item = zipfile.ZipInfo(framework_binary_entry)
+                binary_item.compress_type = zipfile.ZIP_DEFLATED
+                binary_item.external_attr = 0o100755 << 16
+                destination.writestr(binary_item, framework_binary)
+                info_item = zipfile.ZipInfo(framework_info_entry)
+                info_item.compress_type = zipfile.ZIP_DEFLATED
+                info_item.external_attr = 0o100644 << 16
+                destination.writestr(info_item, framework_info_bytes)
 
         with zipfile.ZipFile(temp_path, "r") as result:
             bad_entry = result.testzip()
@@ -129,19 +145,22 @@ def patch_ipa(input_path: Path, dylib_path: Path, output_path: Path, force: bool
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path, help="decrypted Twitch IPA supplied by the user")
-    parser.add_argument("--dylib", type=Path, default=Path("build/TwitchAdBlock.dylib"))
+    default_framework = Path("Tweach.framework")
+    if not default_framework.is_dir() and Path("build/Tweach.framework").is_dir():
+        default_framework = Path("build/Tweach.framework")
+    parser.add_argument("--framework", type=Path, default=default_framework)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     output = args.output or args.input.with_name(f"{args.input.stem}_VAFT-patched.ipa")
     try:
-        injected, removed = patch_ipa(args.input, args.dylib, output, args.force)
+        injected, removed = patch_ipa(args.input, args.framework, output, args.force)
     except (OSError, ValueError, MachOError, zipfile.BadZipFile) as error:
         parser.error(str(error))
     if removed:
         print(f"removed donor load command(s): {', '.join(removed)}")
     action = "added load command and injected" if injected else "updated"
-    print(f"{action} {DYLIB_NAME}: {output}")
+    print(f"{action} {FRAMEWORK_NAME}: {output}")
     print("The output is not signed. Sign it with your sideloading tool before installation.")
     return 0
 

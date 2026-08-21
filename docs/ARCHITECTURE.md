@@ -46,21 +46,46 @@ On an ad-bearing media playlist, the port:
 Unknown media-playlist URLs pass through without borrowing another stream's
 state.
 
+## Diagnostics
+
+`TASDiagnostics` registers two runtime-created UIKit controllers and adds an
+`Ad Block` navigation item to Twitch's `AppSettingsViewController`. No Twitch
+settings data source is replaced or modified.
+
+Logging is disabled by default and stored under the app's Application Support
+directory when enabled. The log records only classified events and summaries:
+
+- Interception transport and sanitized request path
+- HTTP status and response size
+- Master/variant ownership
+- Segment and marker counts
+- Alternate player type outcome
+- VAFT fallback and suppression decisions
+
+Query strings, fragments, headers, access tokens, GraphQL bodies, and manifest
+contents are excluded. The file rotates at 512 KiB. Session counters remain in
+memory and are included in the in-app report.
+
 ## Signing layout
 
-The arm64 dylib contains:
+Both arm64 outputs contain 16 KiB of Mach-O header padding.
 
-- `@rpath/TwitchAdBlock.dylib` as `LC_ID_DYLIB`
-- 16 KiB of Mach-O header padding
-- A 64 KiB `LC_CODE_SIGNATURE` reservation ending at EOF
+- `TwitchAdBlock.dylib` uses `@rpath/TwitchAdBlock.dylib` and is packaged for
+  jailbreak injection.
+- `Tweach.framework/Tweach` uses `@rpath/Tweach.framework/Tweach` and is
+  packaged for sideloading. Its file-backed segments fill their existing 16 KiB
+  ranges, and its compact ad-hoc signature ends at EOF so iOS signers can
+  replace it cleanly.
 
-The reservation allows ordinary IPA signers to replace the ad-hoc signature in
-place instead of restructuring the Mach-O.
+The sideload compatibility identity is required because the tested resigning
+path correctly rescans the donor filename while rejecting an otherwise
+byte-equivalent dylib at a new physical path.
 
 ## Installation paths
 
-For sideloading, the patcher removes the donor Tweach load command and dylib,
-then injects `TwitchAdBlock.dylib` into the app's `Frameworks` directory. For a
-jailbroken install, the same library is loaded into the `tv.twitch` process by
-a Substrate-compatible filter. Rootful packages install under `/Library`;
+For sideloading, the patcher removes obsolete dylib/framework commands, places
+the release `Tweach.framework` in the app's Frameworks directory, and injects
+its compatibility load command. For a jailbroken install,
+`TwitchAdBlock.dylib` is loaded into the `tv.twitch` process by a
+Substrate-compatible filter. Rootful packages install under `/Library`;
 rootless packages install beneath `/var/jb/Library`.

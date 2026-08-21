@@ -2,7 +2,6 @@
  * TwitchAdBlock for iOS
  *
  * Native iOS adaptation of pixeltris/TwitchAdSolutions VAFT v24.
- * The original project is MIT licensed.
  *
  * This intentionally uses the Objective-C runtime instead of private Twitch
  * symbols. Twitch's Amazon IVS player and AVFoundation playback are both
@@ -22,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include "TASDiagnostics.h"
 
 typedef unsigned long NSUInteger;
 typedef long NSInteger;
@@ -437,6 +438,8 @@ static id normalized_graphql_body(id body) {
         free(json);
         return body;
     }
+    tas_diag_metric(TAS_DIAG_GRAPHQL_REWRITE, 1);
+    tas_diag_log("GQL_REWRITE", "Playback access-token request playerType normalized to popout");
     json = replace_json_string(json, "playerType", "popout");
     id result = data_from_bytes(json, strlen(json));
     free(json);
@@ -529,6 +532,8 @@ static void protocol_start_loading(id self, SEL command) {
     id client = msg0(self, "client");
 
     if (original_url && is_cached_ad_segment(original_url)) {
+        tas_diag_metric(TAS_DIAG_SYNTHETIC_SEGMENT, 1);
+        tas_diag_log_url("SYNTHETIC_SEGMENT", original_url, "transport=NSURLProtocol");
         id data = blank_video_data();
         id response = http_response(original_url, 200, "video/mp4", data_length(data), nil);
         vmsg3(client, "URLProtocol:didReceiveResponse:cacheStoragePolicy:", self, response, 0);
@@ -549,12 +554,29 @@ static void protocol_start_loading(id self, SEL command) {
     id body = msg0(request, "HTTPBody");
     if (body) vmsg1(request, "setHTTPBody:", normalized_graphql_body(body));
 
+    if (original_url && is_twitch_hls_url(original_url)) {
+        tas_diag_metric(TAS_DIAG_HLS_INTERCEPTED, 1);
+        tas_diag_log_url("HLS_REQUEST", original_url, "transport=NSURLProtocol");
+    }
+
     id response = nil;
     id error = nil;
     id data = synchronous_request(request, &response, &error);
     id output_data = data;
     id output_response = response;
     id rewritten_response = nil;
+    if (original_url && is_twitch_hls_url(original_url)) {
+        char detail[256];
+        snprintf(detail, sizeof(detail), "transport=NSURLProtocol status=%ld bytes=%zu error=%s",
+                 response ? (long)imsg0(response, "statusCode") : 0L,
+                 data ? data_length(data) : 0,
+                 error ? "yes" : "no");
+        tas_diag_log_url("HLS_RESPONSE", original_url, detail);
+        if (error || !data || !response || imsg0(response, "statusCode") < 200 ||
+            imsg0(response, "statusCode") >= 300) {
+            tas_diag_metric(TAS_DIAG_HLS_FAILURE, 1);
+        }
+    }
     if (!error && data && response && original_url && is_twitch_hls_url(original_url)) {
         char *text = copy_data_text(data);
         if (text && starts_with(text, "#EXTM3U")) {
@@ -923,24 +945,103 @@ static bool request_access_token(const char *channel, const char *player_type,
     id response = nil;
     id error = nil;
     id data = synchronous_request(request, &response, &error);
-    if (!data || error || imsg0(response, "statusCode") != 200) return false;
+    if (!data || error || !response || imsg0(response, "statusCode") != 200) {
+        char detail[256];
+        snprintf(detail, sizeof(detail), "player=%s status=%ld data=%s error=%s",
+                 player_type, response ? (long)imsg0(response, "statusCode") : 0L,
+                 data ? "yes" : "no", error ? "yes" : "no");
+        tas_diag_metric(TAS_DIAG_TOKEN_FAILURE, 1);
+        tas_diag_log("TOKEN_FAILURE", detail);
+        return false;
+    }
     id json_error = nil;
     id root = ((id (*)(id, SEL, id, NSUInteger, id *))objc_msgSend)(
         (id)objc_getClass("NSJSONSerialization"), sel_registerName("JSONObjectWithData:options:error:"),
         data, 0, &json_error);
-    if (!root || json_error) return false;
+    if (!root || json_error) {
+        tas_diag_metric(TAS_DIAG_TOKEN_FAILURE, 1);
+        tas_diag_log("TOKEN_FAILURE", "PlaybackAccessToken response was not valid JSON");
+        return false;
+    }
     id access = json_value(json_value(root, "data"), "streamPlaybackAccessToken");
     const char *sig = utf8(json_value(access, "signature"));
     const char *tok = utf8(json_value(access, "value"));
-    if (!sig || !tok) return false;
+    if (!sig || !tok) {
+        char detail[160];
+        snprintf(detail, sizeof(detail), "player=%s response missing signature or token", player_type);
+        tas_diag_metric(TAS_DIAG_TOKEN_FAILURE, 1);
+        tas_diag_log("TOKEN_FAILURE", detail);
+        return false;
+    }
     copy_string(signature, signature_capacity, sig);
     copy_string(token, token_capacity, tok);
+    char detail[96];
+    snprintf(detail, sizeof(detail), "player=%s", player_type);
+    tas_diag_log("TOKEN_SUCCESS", detail);
     return true;
 }
 
 static bool has_ad_markers(const char *playlist) {
     return contains(playlist, "stitched") ||
            contains(playlist, "\"MIDROLL\"") || contains(playlist, "\"midroll\"");
+}
+
+typedef struct {
+    size_t extinf;
+    size_t live_segments;
+    size_t non_live_segments;
+    size_t variants;
+    size_t dateranges;
+    size_t discontinuities;
+    size_t prefetches;
+    size_t scte_markers;
+    bool stitched;
+    bool midroll;
+    bool twitch_ad_url;
+} TASManifestStats;
+
+static TASManifestStats manifest_stats(const char *playlist) {
+    TASManifestStats stats = {0};
+    if (!playlist) return stats;
+    stats.stitched = contains(playlist, "stitched");
+    stats.midroll = contains(playlist, "\"MIDROLL\"") || contains(playlist, "\"midroll\"");
+    stats.twitch_ad_url = contains(playlist, "X-TV-TWITCH-AD-URL") ||
+                          contains(playlist, "X-TV-TWITCH-AD-CLICK-TRACKING-URL");
+    char *copy = strdup(playlist);
+    if (!copy) return stats;
+    char *save = NULL;
+    for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        trim_manifest_line(line);
+        if (starts_with(line, "#EXTINF")) {
+            stats.extinf++;
+            if (contains(line, ",live")) stats.live_segments++;
+            else stats.non_live_segments++;
+        } else if (starts_with(line, "#EXT-X-STREAM-INF")) {
+            stats.variants++;
+        } else if (starts_with(line, "#EXT-X-DATERANGE")) {
+            stats.dateranges++;
+        } else if (starts_with(line, "#EXT-X-DISCONTINUITY")) {
+            stats.discontinuities++;
+        } else if (starts_with(line, "#EXT-X-TWITCH-PREFETCH")) {
+            stats.prefetches++;
+        }
+        if (contains(line, "SCTE")) stats.scte_markers++;
+    }
+    free(copy);
+    return stats;
+}
+
+static void format_manifest_stats(char *output, size_t capacity, const TASManifestStats *stats,
+                                  size_t bytes, bool mapped) {
+    snprintf(output, capacity,
+             "bytes=%zu mapped=%s variants=%zu extinf=%zu live=%zu non_live=%zu "
+             "stitched=%s midroll=%s ad_url_tag=%s daterange=%zu discontinuity=%zu "
+             "prefetch=%zu scte=%zu",
+             bytes, mapped ? "yes" : "no", stats->variants, stats->extinf,
+             stats->live_segments, stats->non_live_segments,
+             stats->stitched ? "yes" : "no", stats->midroll ? "yes" : "no",
+             stats->twitch_ad_url ? "yes" : "no", stats->dateranges,
+             stats->discontinuities, stats->prefetches, stats->scte_markers);
 }
 
 static void clear_backup_master(TASStreamRef stream_ref, size_t index) {
@@ -987,14 +1088,25 @@ static char *load_backup_master(const char *original_master, const char *channel
     id master_data = nil;
     id master_response = nil;
     if (!fetch_bytes(master_url, &master_data, &master_response)) {
+        char detail[192];
+        snprintf(detail, sizeof(detail), "player=%s status=%ld",
+                 g_player_types[index], master_response ? (long)imsg0(master_response, "statusCode") : 0L);
+        tas_diag_log_url("BACKUP_MASTER_FAILURE", master_url, detail);
         free(master_url);
         return NULL;
     }
     char *master = copy_data_text(master_data);
     if (!master) {
+        char detail[128];
+        snprintf(detail, sizeof(detail), "player=%s response copy failed", g_player_types[index]);
+        tas_diag_log("BACKUP_MASTER_FAILURE", detail);
         free(master_url);
         return NULL;
     }
+    char detail[192];
+    snprintf(detail, sizeof(detail), "player=%s bytes=%zu cached=no",
+             g_player_types[index], strlen(master));
+    tas_diag_log_url("BACKUP_MASTER", master_url, detail);
     if (strlen(master) < TAS_MANIFEST_CAPACITY && strlen(master_url) < TAS_URL_CAPACITY) {
         pthread_mutex_lock(&g_lock);
         if (stream_ref_matches_locked(stream_ref)) {
@@ -1036,6 +1148,15 @@ static char *fetch_vaft_variant(const char *original_master, const char *channel
             bool loaded = variant_url && fetch_bytes(variant_url, &variant_data, &variant_response);
             char *variant = loaded ? copy_data_text(variant_data) : NULL;
             bool has_ads = !variant || has_ad_markers(variant);
+            char candidate_detail[256];
+            snprintf(candidate_detail, sizeof(candidate_detail),
+                     "player=%s cached_master=%s loaded=%s status=%ld bytes=%zu known_ad=%s",
+                     g_player_types[player_index], was_cached ? "yes" : "no",
+                     loaded ? "yes" : "no",
+                     variant_response ? (long)imsg0(variant_response, "statusCode") : 0L,
+                     variant ? strlen(variant) : 0,
+                     has_ads ? "yes" : "no");
+            tas_diag_log_url("VAFT_CANDIDATE", variant_url, candidate_detail);
 
             if (variant && player_index == 0) {
                 free(fallback);
@@ -1061,6 +1182,10 @@ static char *fetch_vaft_variant(const char *original_master, const char *channel
                 }
                 pthread_mutex_unlock(&g_lock);
                 fprintf(stderr, "[TAS] VAFT switched %s to clean %s HLS\n", channel, g_player_types[player_index]);
+                tas_diag_metric(TAS_DIAG_CLEAN_ALTERNATE, 1);
+                char detail[128];
+                snprintf(detail, sizeof(detail), "player=%s", g_player_types[player_index]);
+                tas_diag_log_url("VAFT_CLEAN_SWAP", variant_url, detail);
                 free(fallback);
                 free(fallback_url);
                 *selected_base_out = variant_url;
@@ -1077,6 +1202,10 @@ static char *fetch_vaft_variant(const char *original_master, const char *channel
     if (fallback) {
         fprintf(stderr, "[TAS] VAFT using %s fallback with stitched segments suppressed\n",
                 fallback_type ?: "last-resort");
+        char detail[160];
+        snprintf(detail, sizeof(detail), "player=%s known_ad=yes action=strip",
+                 fallback_type ?: "last-resort");
+        tas_diag_log_url("VAFT_FALLBACK", fallback_url, detail);
         *selected_base_out = fallback_url;
         return fallback;
     }
@@ -1091,10 +1220,12 @@ static char *strip_ad_segments(const char *playlist, const char *base_url) {
     size_t capacity = 0;
     char *save = NULL;
     bool cache_next_uri = false;
+    size_t stripped_segments = 0;
     for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
         trim_manifest_line(line);
         if (cache_next_uri && line[0] != '#') {
             remember_ad_segment(base_url, line);
+            stripped_segments++;
             cache_next_uri = false;
         }
         if (starts_with(line, "#EXTINF") && !contains(line, ",live")) {
@@ -1105,6 +1236,12 @@ static char *strip_ad_segments(const char *playlist, const char *base_url) {
         append_text(&result, &length, &capacity, "\n");
     }
     free(copy);
+    if (stripped_segments) {
+        tas_diag_metric(TAS_DIAG_STRIPPED_SEGMENT, stripped_segments);
+        char detail[128];
+        snprintf(detail, sizeof(detail), "segments=%zu", stripped_segments);
+        tas_diag_log_url("SEGMENTS_SUPPRESSED", base_url, detail);
+    }
     return result ?: strdup("#EXTM3U\n");
 }
 
@@ -1174,6 +1311,11 @@ static char *process_manifest(const char *url, const char *playlist, bool custom
     char channel[512];
     channel_from_master_url(url, channel, sizeof(channel));
     if (channel[0]) {
+        TASManifestStats stats = manifest_stats(playlist);
+        char detail[768];
+        format_manifest_stats(detail, sizeof(detail), &stats, strlen(playlist), true);
+        tas_diag_metric(TAS_DIAG_MASTER_MANIFEST, 1);
+        tas_diag_log_url("MASTER_MANIFEST", url, detail);
         pthread_mutex_lock(&g_lock);
         TASStreamRef stream_ref = update_stream_master_locked(channel, url, playlist);
         register_variant_routes_locked(stream_ref, url, playlist);
@@ -1185,8 +1327,22 @@ static char *process_manifest(const char *url, const char *playlist, bool custom
     char framerate[64] = "";
     TASStreamSnapshot stream;
     if (!snapshot_stream_for_variant(url, &stream)) {
+        TASManifestStats stats = manifest_stats(playlist);
+        char detail[768];
+        format_manifest_stats(detail, sizeof(detail), &stats, strlen(playlist), false);
+        tas_diag_metric(TAS_DIAG_VARIANT_MANIFEST, 1);
+        tas_diag_metric(TAS_DIAG_UNMAPPED_VARIANT, 1);
+        if (has_ad_markers(playlist)) tas_diag_metric(TAS_DIAG_AD_MANIFEST, 1);
+        tas_diag_log_url("VARIANT_UNMAPPED", url, detail);
         return rewrite_manifest_urls(playlist, url, custom_scheme);
     }
+    TASManifestStats stats = manifest_stats(playlist);
+    char manifest_detail[768];
+    format_manifest_stats(manifest_detail, sizeof(manifest_detail), &stats, strlen(playlist), true);
+    tas_diag_metric(TAS_DIAG_VARIANT_MANIFEST, 1);
+    if (has_ad_markers(playlist)) tas_diag_metric(TAS_DIAG_AD_MANIFEST, 1);
+    tas_diag_log_url(has_ad_markers(playlist) ? "VARIANT_AD_MARKED" : "VARIANT_MANIFEST",
+                     url, manifest_detail);
     variant_metadata(stream.master_manifest, stream.master_url, url,
                      resolution, sizeof(resolution), framerate, sizeof(framerate));
 
@@ -1215,6 +1371,8 @@ static char *process_manifest(const char *url, const char *playlist, bool custom
             selected = strdup(playlist);
             selected_base = strdup(url);
             fprintf(stderr, "[TAS] VAFT alternates unavailable; suppressing stitched segments\n");
+            tas_diag_log_url("VAFT_ALTERNATES_UNAVAILABLE", url,
+                             "action=use_original_and_suppress_known_ad_segments");
         }
         if (has_ad_markers(selected)) {
             char *stripped = strip_ad_segments(selected, selected_base);
@@ -1241,6 +1399,10 @@ static BOOL loader_handle(id self, SEL command, id loading_request) {
     const char *custom_url = utf8(msg0(original_url, "absoluteString"));
     if (!custom_url) return NO;
     char *url = https_scheme_url(custom_url);
+    if (is_twitch_hls_url(url)) {
+        tas_diag_metric(TAS_DIAG_HLS_INTERCEPTED, 1);
+        tas_diag_log_url("HLS_REQUEST", url, "transport=AVAssetResourceLoader");
+    }
     id network_request = msg0(request, "mutableCopy");
     vmsg1(network_request, "setURL:", nsurl(url));
     vmsg2(network_request, "setValue:forHTTPHeaderField:", nsstr("1"), nsstr(TAS_INTERNAL_HEADER));
@@ -1250,12 +1412,20 @@ static BOOL loader_handle(id self, SEL command, id loading_request) {
     bool is_synthetic = is_cached_ad_segment(url);
     id data = nil;
     if (is_synthetic) {
+        tas_diag_metric(TAS_DIAG_SYNTHETIC_SEGMENT, 1);
+        tas_diag_log_url("SYNTHETIC_SEGMENT", url, "transport=AVAssetResourceLoader");
         data = blank_video_data();
         response = http_response(url, 200, "video/mp4", data_length(data), nil);
     } else {
         data = synchronous_request(network_request, &response, &error);
     }
     if (error || !data || !response) {
+        tas_diag_metric(TAS_DIAG_HLS_FAILURE, 1);
+        char detail[192];
+        snprintf(detail, sizeof(detail), "transport=AVAssetResourceLoader status=%ld data=%s error=%s",
+                 response ? (long)imsg0(response, "statusCode") : 0L,
+                 data ? "yes" : "no", error ? "yes" : "no");
+        tas_diag_log_url("HLS_FAILURE", url, detail);
         vmsg1(loading_request, "finishLoadingWithError:", error);
         objc_release(network_request);
         free(url);
@@ -1263,6 +1433,15 @@ static BOOL loader_handle(id self, SEL command, id loading_request) {
     }
 
     const char *mime = utf8(msg0(response, "MIMEType"));
+    if (is_twitch_hls_url(url)) {
+        char detail[224];
+        snprintf(detail, sizeof(detail), "transport=AVAssetResourceLoader status=%ld bytes=%zu",
+                 (long)imsg0(response, "statusCode"), data_length(data));
+        tas_diag_log_url("HLS_RESPONSE", url, detail);
+        if (imsg0(response, "statusCode") < 200 || imsg0(response, "statusCode") >= 300) {
+            tas_diag_metric(TAS_DIAG_HLS_FAILURE, 1);
+        }
+    }
     char *text = NULL;
     id output_data = data;
     if (contains(url, ".m3u8") || (mime && contains(mime, "mpegurl"))) {
@@ -1303,6 +1482,7 @@ static id asset_init(id self, SEL command, id url, id options) {
         !(contains(absolute, "ttvnw.net") || contains(absolute, "twitch.tv"))) {
         return ((id (*)(id, SEL, id, id))g_original_asset_init)(self, command, url, options);
     }
+    tas_diag_log_url("ASSET_INTERCEPT", absolute, "transport=AVURLAsset");
     char *custom = custom_scheme_url(absolute);
     id asset = ((id (*)(id, SEL, id, id))g_original_asset_init)(self, command, nsurl(custom), options);
     free(custom);
@@ -1419,5 +1599,6 @@ static void tas_initialize(void) {
     swizzle_method(session, "dataTaskWithRequest:completionHandler:",
                    (IMP)data_task_with_request_completion,
                    &g_original_data_task_request_completion, false);
+    tas_diagnostics_initialize();
     fprintf(stderr, "[TAS] TwitchAdSolutions VAFT v24 iOS port loaded\n");
 }

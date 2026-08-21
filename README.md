@@ -4,20 +4,19 @@ A native iOS port of the **VAFT** strategy from
 [pixeltris/TwitchAdSolutions](https://github.com/pixeltris/TwitchAdSolutions).
 It supports both sideloaded decrypted copies of Twitch and jailbroken devices.
 
-Releases contain the open-source dylib, IPA releases, an IPA patcher,
-rootful/rootless jailbreak packages, and checksums.
+Releases contain the open-source jailbreak dylib, sideload framework, IPA
+releases, an IPA patcher, rootful/rootless jailbreak packages, and checksums.
 
 ## Status
 
-- Port version: **2.1.0**
+- Port version: **2.2.0**
 - Upstream strategy: **VAFT solution 24**
 - Tested app version: **Twitch 30.4.2, arm64**
-  - Tested on an iPhone 16 Pro on 18.2
-- Tested installation path: LiveContainer/ZSign and ordinary IPA resigning
+  - Tested on an iPhone 16 Pro on iOS 18.2
+- Tested installation paths: ESign and LiveContainer/ZSign
 
 Other Twitch versions may work, but Twitch can change its GraphQL, HLS, or
-Amazon IVS behavior without notice. I haven't tested this on any other devices,
-iOS, or Twitch versions.
+Amazon IVS behavior without notice.
 
 ## What it does
 
@@ -30,12 +29,30 @@ iOS, or Twitch versions.
   available.
 - Maintains isolated state for simultaneous streams, including Twitch mobile's
   PiP player and muted profile previews.
+- Adds an Ad Block settings page with persistent, sanitized diagnostics.
 
-The project is completely independent of Tweach. When a Tweach-modified IPA is
-used as a donor solely because it contains a newer decrypted Twitch build, the
-patcher removes `Tweach.dylib` and its Mach-O load command before injecting
-`TwitchAdBlock.dylib`. No Tweach authentication, DRM, account system, or
-developer-server calls remain.
+The sideload build uses the physical framework and load path
+`Tweach.framework/Tweach` for signer compatibility. The binary in that bundle
+contains this project's VAFT implementation. Jailbreak packages use the clean
+`TwitchAdBlock.dylib` identity.
+
+## Diagnostics
+
+Open **Profile → Settings (cog) → Ad Block**. The diagnostics page provides:
+
+- A persistent logging toggle.
+- A live session summary and sanitized event log.
+- One-tap report copying.
+- Log clearing.
+
+Diagnostics distinguish intercepted and missed HLS paths, master and variant
+playlists, unmapped variants, known ad markers, access-token failures, VAFT
+candidate results, clean swaps, and segment suppression. URL query strings and
+fragments, request headers, access tokens, and manifest contents are never
+stored. The log is capped at 512 KiB and rotates automatically.
+
+For a playback regression, enable logging, reproduce the failure, then copy the
+diagnostic report from the same page.
 
 ## Install from a release
 
@@ -48,20 +65,20 @@ Requirements:
 Download the release bundle and run:
 
 ```bash
-python3 tools/patch_ipa.py (TWITCH IPA NAME HERE).ipa \
-  --dylib TwitchAdBlock.dylib \
+python3 tools/patch_ipa.py Twitch.ipa \
+  --framework Tweach.framework \
   --output Twitch-VAFT.ipa
 ```
 
-The resulting IPA is unsigned. Sign `Twitch-VAFT.ipa` with your
-normal sideloading tool before installing it.
+The resulting IPA is unsigned. Sign `Twitch-VAFT.ipa` with your normal
+sideloading tool before installing it.
 
 The patcher:
 
 - Refuses encrypted executables.
-- Removes the donor's `@rpath/Tweach.dylib` load command and dylib file.
-- Adds `@rpath/TwitchAdBlock.dylib` using existing Mach-O header padding.
-- Updates an existing `TwitchAdBlock.dylib` without duplicate commands.
+- Removes old Tweach and TwitchAdBlock dylib/framework load commands.
+- Adds `@rpath/Tweach.framework/Tweach` using existing Mach-O header padding.
+- Replaces any donor `Tweach.framework` with the release framework.
 - Preserves every unrelated IPA entry and verifies that `Assets.car` is
   unchanged.
 
@@ -93,17 +110,22 @@ To use a Zig binary outside `PATH`:
 ZIG=/path/to/zig make verify
 ```
 
-The output is `build/TwitchAdBlock.dylib`. `make deb` creates rootful and
-rootless packages, while `make release` creates the complete set used by
-GitHub Releases under `dist/`.
+The build produces both identities:
+
+- `build/TwitchAdBlock.dylib` for rootful/rootless jailbreak packages.
+- `build/Tweach.framework` for sideload IPA patching.
+
+`make deb` creates the jailbreak packages, while `make release` creates the
+complete set used by GitHub Releases under `dist/`.
 
 ## Troubleshooting
 
 ### The signer says it cannot sign the dylib
 
-Use the release dylib rather than rebuilding with arbitrary linker settings.
-The build reserves 64 KiB for a replacement code signature and has been tested
-against LiveContainer's ZSign implementation.
+Use the `Tweach.framework` compatibility build for sideloaded IPAs. Its Mach-O
+layout is normalized to the 16 KiB segment boundaries required by the tested
+iOS signing paths. The jailbreak dylib retains a 64 KiB replacement-signature
+reservation.
 
 ### The app launches logged out but crashes after login
 
@@ -117,10 +139,9 @@ with no asset catalog and verifies its CRC after repackaging.
 Upgrade to 2.0.3 or newer. Older native builds used one global VAFT context and
 could substitute one player's clean playlist into another player.
 
-## Repository policy
-
-- Reproduction reports should include the Twitch version, install method, and a
-  description of playback behavior—not account tokens or credentials.
+Playback reports should include the Twitch and iOS versions, installation
+method, failure type, and the copied diagnostic report. Remove anything you do
+not want to share before posting it.
 
 See [Architecture](docs/ARCHITECTURE.md), [Version history](docs/HISTORY.md),
 [Contributing](CONTRIBUTING.md), and [Upstream provenance](UPSTREAM.md) for more

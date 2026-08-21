@@ -7,8 +7,9 @@ exports:
   - targets:         [ arm64-ios ]
     symbols:         [ _class_addMethod, _class_getClassMethod,
                        _class_getInstanceMethod, _method_getImplementation,
+                       _method_getTypeEncoding,
                        _method_setImplementation, _objc_allocateClassPair,
-                       _objc_getClass, _objc_msgSend, _objc_registerClassPair,
+                       _objc_getAssociatedObject, _objc_getClass, _objc_msgSend, _objc_registerClassPair,
                        _objc_release, _objc_retain, _objc_setAssociatedObject,
                        _object_getClass, _sel_registerName ]
 ...

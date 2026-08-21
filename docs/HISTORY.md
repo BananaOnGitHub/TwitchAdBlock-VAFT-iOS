@@ -18,6 +18,7 @@ the Git history does not pretend to have evidence that no longer exists.
 | 2.0.2 | 2026-08-12 | VAFT solution 24 | Exact surviving archive | Packaging-only fix: restored the complete Twitch `Assets.car`; native code is byte-identical to 2.0.1. |
 | 2.0.3 | 2026-08-18 | VAFT solution 24 | Exact surviving archive | Isolated VAFT state per stream to fix PiP/profile-preview cross-talk. Added the local patcher and tests. |
 | 2.1.0 | 2026-08-18 | VAFT solution 24 | Current source | Renamed the dylib/load command and added standalone rootful/rootless DEBs. |
+| 2.2.0 | 2026-08-21 | VAFT solution 24 | Current source | Added the in-app settings/diagnostics system and restored the proven framework-based sideload compatibility identity while retaining the clean jailbreak identity. |
 
 ## Binary evidence
 
@@ -48,7 +49,11 @@ rendition fallback, and blank-segment response. Version 2.0.3 retained VAFT but
 replaced its single global stream state with per-channel contexts required by
 Twitch mobile's simultaneous PiP and muted profile-preview players.
 
-The early `Tweach.dylib` name was only a donor compatibility shim: the Twitch
-executable already had that load command. Version 2.1.0 made the project fully
-standalone by removing the donor command and installing
-`@rpath/TwitchAdBlock.dylib` instead.
+The early `Tweach.dylib` name was a donor compatibility shim: the Twitch
+executable already had that load command. Version 2.1.0 introduced the clean
+`@rpath/TwitchAdBlock.dylib` identity used by the standalone jailbreak packages.
+Testing showed that common sideload resigners rejected the same library after a
+filename/load-command change and also rejected the initial replacement dylib's
+Mach-O layout. Version 2.2.0 keeps the clean identity for jailbreaks and uses
+the donor-compatible `Tweach.framework/Tweach` identity with 16 KiB-aligned
+segments for sideloaded IPAs.

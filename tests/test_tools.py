@@ -61,13 +61,24 @@ class MachOTests(unittest.TestCase):
 
 
 class IPAPatcherTests(unittest.TestCase):
+    @staticmethod
+    def make_framework(root: Path) -> Path:
+        framework = root / "Tweach.framework"
+        framework.mkdir()
+        (framework / "Tweach").write_bytes(b"synthetic framework binary")
+        (framework / "Info.plist").write_bytes(plistlib.dumps({
+            "CFBundleExecutable": "Tweach",
+            "CFBundleIdentifier": "io.github.bananaongithub.tas.tweach",
+            "CFBundlePackageType": "FMWK",
+        }))
+        return framework
+
     def test_patches_synthetic_ipa_without_touching_assets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "input.ipa"
             output = root / "output.ipa"
-            dylib = root / "TwitchAdBlock.dylib"
-            dylib.write_bytes(b"synthetic dylib")
+            framework = self.make_framework(root)
             info = plistlib.dumps({"CFBundleExecutable": "Twitch"})
             assets = b"synthetic asset catalog"
             with zipfile.ZipFile(source, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -77,13 +88,20 @@ class IPAPatcherTests(unittest.TestCase):
                 archive.writestr("Payload/Twitch.app/Assets.car", assets)
                 archive.writestr("Payload/Twitch.app/Frameworks/Tweach.dylib", b"donor tweak")
 
-            injected, removed = patch_ipa(source, dylib, output)
+            injected, removed = patch_ipa(source, framework, output)
             self.assertTrue(injected)
             self.assertEqual(removed, [DONOR_LOAD_PATH])
             with zipfile.ZipFile(output) as archive:
                 self.assertEqual(archive.read("Payload/Twitch.app/Assets.car"), assets)
                 self.assertNotIn("Payload/Twitch.app/Frameworks/Tweach.dylib", archive.namelist())
-                self.assertEqual(archive.read("Payload/Twitch.app/Frameworks/TwitchAdBlock.dylib"), b"synthetic dylib")
+                self.assertEqual(
+                    archive.read("Payload/Twitch.app/Frameworks/Tweach.framework/Tweach"),
+                    b"synthetic framework binary",
+                )
+                framework_info = plistlib.loads(
+                    archive.read("Payload/Twitch.app/Frameworks/Tweach.framework/Info.plist")
+                )
+                self.assertEqual(framework_info["CFBundleExecutable"], "Tweach")
                 executable = archive.read("Payload/Twitch.app/Twitch")
                 self.assertIn(LOAD_PATH, loaded_dylibs(executable))
                 self.assertNotIn(DONOR_LOAD_PATH, loaded_dylibs(executable))
@@ -92,14 +110,13 @@ class IPAPatcherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "encrypted.ipa"
-            dylib = root / "TwitchAdBlock.dylib"
-            dylib.write_bytes(b"synthetic dylib")
+            framework = self.make_framework(root)
             with zipfile.ZipFile(source, "w") as archive:
                 archive.writestr("Payload/Twitch.app/Info.plist", plistlib.dumps({"CFBundleExecutable": "Twitch"}))
                 archive.writestr("Payload/Twitch.app/Twitch", synthetic_executable(cryptid=1))
                 archive.writestr("Payload/Twitch.app/Assets.car", b"assets")
             with self.assertRaises(ValueError):
-                patch_ipa(source, dylib, root / "output.ipa")
+                patch_ipa(source, framework, root / "output.ipa")
 
 
 if __name__ == "__main__":

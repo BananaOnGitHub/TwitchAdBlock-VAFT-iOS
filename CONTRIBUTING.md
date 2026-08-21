@@ -11,6 +11,7 @@ Include:
 - Sideloading/container tool, or jailbreak and injection framework
 - Whether the account was signed in
 - Whether the failure involved a preroll, midroll, PiP, or profile preview
+- The copied in-app diagnostic report after reproducing the failure
 
 Do not include Twitch credentials, OAuth tokens, or client-integrity headers.
 
